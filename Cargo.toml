@@ -1,0 +1,17 @@
+[package]
+name = "thrift_rs_pyo3"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "thrift_rs_pyo3"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.24.2"
+serde = { version = "1.0", features = ["derive"] }
+nom = "7.1"
+serde_json = "1.0"
+byteorder = "1.5"
+thiserror = "1.0"
