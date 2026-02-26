@@ -7,15 +7,14 @@ class TBinaryProtocol:
 
     def __init__(self, trans=None):
         self.trans = trans
-        self._protocol = BinaryProtocol()
 
     def write_struct(self, struct_def: ThriftStruct, data: Dict[str, Any]) -> bytes:
         """Serialize a struct to binary format"""
-        return self._protocol.serialize_struct(struct_def, data)
+        return BinaryProtocol.serialize_struct(struct_def, data)
 
     def read_struct(self, struct_def: ThriftStruct, data: bytes) -> Dict[str, Any]:
         """Deserialize a struct from binary format"""
-        return self._protocol.deserialize_struct(struct_def, data)
+        return BinaryProtocol.deserialize_struct(struct_def, data)
 
 
 class TBinaryProtocolFactory:
@@ -25,14 +24,13 @@ class TBinaryProtocolFactory:
         return TBinaryProtocol(trans)
 
 
-# Convenience functions similar to thriftpy2
+# Convenience functions similar to thriftpy2 — call the Rust static methods directly
+# to avoid constructing any Python wrapper objects per call.
 def serialize(struct_def: ThriftStruct, data: Dict[str, Any]) -> bytes:
     """Serialize struct data to binary format"""
-    protocol = TBinaryProtocol()
-    return protocol.write_struct(struct_def, data)
+    return BinaryProtocol.serialize_struct(struct_def, data)
 
 
 def deserialize(struct_def: ThriftStruct, data: bytes) -> Dict[str, Any]:
     """Deserialize binary data to struct"""
-    protocol = TBinaryProtocol()
-    return protocol.read_struct(struct_def, data)
+    return BinaryProtocol.deserialize_struct(struct_def, data)

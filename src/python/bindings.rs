@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyBytes};
+use pyo3::types::{PyDict, PyBytes};
 use crate::parser::{Parser, ast::*};
-use crate::parser::ast::ThriftStruct as ThriftStructSchema;
 use crate::protocol::{BinaryProtocolReader, BinaryProtocolWriter, TType, FieldBegin};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -38,14 +37,23 @@ impl ThriftParser {
     pub fn get_struct(&self, name: &str) -> PyResult<Option<ThriftStruct>> {
         match &self.document {
             Some(doc) => {
-                Ok(doc.structs.get(name).map(|s| ThriftStruct {
-                    name: s.name.clone(),
-                    fields: s.fields.iter().map(|f| ThriftField {
+                Ok(doc.structs.get(name).map(|s| {
+                    let fields: Vec<ThriftField> = s.fields.iter().map(|f| ThriftField {
                         id: f.id,
                         name: f.name.clone(),
                         required: f.required,
                         field_type: f.field_type.clone(),
-                    }).collect(),
+                    }).collect();
+                    // Build field_map once at construction time
+                    let field_map: HashMap<i16, usize> = fields.iter()
+                        .enumerate()
+                        .map(|(idx, f)| (f.id, idx))
+                        .collect();
+                    ThriftStruct {
+                        name: s.name.clone(),
+                        fields,
+                        field_map,
+                    }
                 }))
             }
             None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No document parsed yet")),
@@ -60,18 +68,21 @@ pub struct ThriftStruct {
     pub name: String,
     #[pyo3(get)]
     pub fields: Vec<ThriftField>,
+    /// Cached map from field id -> index in `fields`, built once at parse time.
+    field_map: HashMap<i16, usize>,
 }
 
 #[pymethods]
 impl ThriftStruct {
     pub fn serialize(&self, data: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
-        let mut buffer = Vec::new();
+        // Pre-allocate a reasonable buffer size to avoid reallocations
+        let mut buffer = Vec::with_capacity(128 + self.fields.len() * 16);
         let mut writer = BinaryProtocolWriter::new(&mut buffer);
 
         for field in &self.fields {
             if let Some(value) = data.get_item(&field.name)? {
                 let field_begin = FieldBegin {
-                    name: Some(field.name.clone()),
+                    name: None,
                     field_type: thrift_type_to_ttype(&field.field_type),
                     id: field.id,
                 };
@@ -89,32 +100,32 @@ impl ThriftStruct {
         Ok(buffer)
     }
 
-    pub fn deserialize(&self, data: &[u8]) -> PyResult<PyObject> {
+    pub fn deserialize<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyDict>> {
         let mut cursor = Cursor::new(data);
         let mut reader = BinaryProtocolReader::new(&mut cursor);
 
-        Python::with_gil(|py| {
-            let result = PyDict::new(py);
-            let field_map: HashMap<i16, &ThriftField> = self.fields.iter()
-                .map(|f| (f.id, f))
-                .collect();
+        let result = PyDict::new(py);
 
-            loop {
-                let field_begin = reader.read_field_begin()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
+        loop {
+            let field_begin = reader.read_field_begin()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
 
-                if field_begin.field_type == TType::Stop {
-                    break;
-                }
-
-                if let Some(field) = field_map.get(&field_begin.id) {
-                    let value = read_value(&mut reader, &field.field_type, py)?;
-                    result.set_item(&field.name, value)?;
-                }
+            if field_begin.field_type == TType::Stop {
+                break;
             }
 
-            Ok(result.into())
-        })
+            if let Some(&idx) = self.field_map.get(&field_begin.id) {
+                let field = &self.fields[idx];
+                let value = read_value(&mut reader, &field.field_type, py)?;
+                result.set_item(&field.name, value)?;
+            } else {
+                // Unknown field — skip it
+                skip_value(&mut reader, field_begin.field_type)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Skip error: {}", e)))?;
+            }
+        }
+
+        Ok(result)
     }
 
     pub fn __repr__(&self) -> String {
@@ -157,11 +168,12 @@ impl BinaryProtocol {
     }
 
     #[staticmethod]
-    pub fn deserialize_struct(struct_def: &ThriftStruct, data: &[u8]) -> PyResult<PyObject> {
-        struct_def.deserialize(data)
+    pub fn deserialize_struct<'py>(py: Python<'py>, struct_def: &ThriftStruct, data: &[u8]) -> PyResult<PyObject> {
+        struct_def.deserialize(py, data).map(|d| d.into())
     }
 }
 
+#[inline]
 fn thrift_type_to_ttype(thrift_type: &ThriftType) -> TType {
     match thrift_type {
         ThriftType::Bool => TType::Bool,
@@ -171,7 +183,7 @@ fn thrift_type_to_ttype(thrift_type: &ThriftType) -> TType {
         ThriftType::I64 => TType::I64,
         ThriftType::Double => TType::Double,
         ThriftType::String => TType::String,
-        ThriftType::Binary => TType::String, // Binary is encoded as string
+        ThriftType::Binary => TType::String, // Binary is encoded as string in wire format
         ThriftType::List(_) => TType::List,
         ThriftType::Set(_) => TType::Set,
         ThriftType::Map(_, _) => TType::Map,
@@ -243,42 +255,42 @@ fn read_value<R: std::io::Read>(
         ThriftType::Bool => {
             let val = reader.read_bool()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().to_owned().into_any().unbind())
         }
         ThriftType::Byte => {
             let val = reader.read_byte()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I16 => {
             let val = reader.read_i16()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I32 => {
             let val = reader.read_i32()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I64 => {
             let val = reader.read_i64()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::Double => {
             let val = reader.read_double()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::String => {
             let val = reader.read_string()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(val.into_py(py))
+            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::Binary => {
             let val = reader.read_binary()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-            Ok(PyBytes::new(py, &val).into())
+            Ok(PyBytes::new(py, &val).into_any().unbind())
         }
         _ => {
             Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
@@ -286,4 +298,45 @@ fn read_value<R: std::io::Read>(
             ))
         }
     }
+}
+
+/// Skip over a value of the given wire type without allocating Python objects.
+fn skip_value<R: std::io::Read>(
+    reader: &mut BinaryProtocolReader<R>,
+    ttype: TType,
+) -> std::io::Result<()> {
+    match ttype {
+        TType::Bool | TType::Byte => { reader.read_u8_raw()?; }
+        TType::I16 => { reader.read_i16_raw()?; }
+        TType::I32 => { reader.read_i32_raw()?; }
+        TType::I64 | TType::Double => { reader.read_i64_raw()?; }
+        TType::String => { reader.read_string()?; }
+        TType::Struct => {
+            loop {
+                let ft = reader.read_u8_raw()?;
+                let ft = TType::from_u8(ft).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+                if ft == TType::Stop { break; }
+                reader.read_i16_raw()?; // field id
+                skip_value(reader, ft)?;
+            }
+        }
+        TType::Map => {
+            let key_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let val_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let size = reader.read_i32_raw()?;
+            for _ in 0..size {
+                skip_value(reader, key_type)?;
+                skip_value(reader, val_type)?;
+            }
+        }
+        TType::List | TType::Set => {
+            let elem_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let size = reader.read_i32_raw()?;
+            for _ in 0..size {
+                skip_value(reader, elem_type)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
