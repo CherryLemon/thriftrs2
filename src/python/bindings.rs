@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyBytes};
+use pyo3::Py;
 use crate::parser::{Parser, ast::*};
 use crate::protocol::{BinaryProtocolReader, BinaryProtocolWriter, TType, FieldBegin};
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ impl ThriftParser {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct ThriftStruct {
     #[pyo3(get)]
@@ -133,7 +134,7 @@ impl ThriftStruct {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ThriftField {
     #[pyo3(get)]
@@ -168,8 +169,8 @@ impl BinaryProtocol {
     }
 
     #[staticmethod]
-    pub fn deserialize_struct<'py>(py: Python<'py>, struct_def: &ThriftStruct, data: &[u8]) -> PyResult<PyObject> {
-        struct_def.deserialize(py, data).map(|d| d.into())
+    pub fn deserialize_struct<'py>(py: Python<'py>, struct_def: &ThriftStruct, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        struct_def.deserialize(py, data).map(|d| d.into_any())
     }
 }
 
@@ -250,7 +251,7 @@ fn read_value<R: std::io::Read>(
     reader: &mut BinaryProtocolReader<R>,
     thrift_type: &ThriftType,
     py: Python,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     match thrift_type {
         ThriftType::Bool => {
             let val = reader.read_bool()

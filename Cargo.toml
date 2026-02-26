@@ -9,9 +9,9 @@ name = "thrift_rs_pyo3"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.24.2"
+pyo3 = "0.28.2"
 serde = { version = "1.0", features = ["derive"] }
-nom = "7.1"
+nom = "8.0.0"
 serde_json = "1.0"
 byteorder = "1.5"
-thiserror = "1.0"
+thiserror = "2.0.18"

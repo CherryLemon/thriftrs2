@@ -4,8 +4,8 @@ use nom::{
     character::complete::{char, digit1, multispace0, multispace1},
     combinator::{map, opt, recognize, value},
     multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, terminated, tuple},
-    IResult,
+    sequence::{delimited, pair, preceded, terminated},
+    IResult, Parser,
 };
 use nom::character::complete::alpha1;
 
@@ -37,14 +37,14 @@ pub fn parse_identifier(input: &str) -> IResult<&str, String> {
             take_while(|c: char| c.is_alphanumeric() || c == '_'),
         )),
         |s: &str| s.to_string(),
-    )(input)
+    ).parse(input)
 }
 
 pub fn parse_number(input: &str) -> IResult<&str, i64> {
     map(
         recognize(pair(opt(char('-')), digit1)),
         |s: &str| s.parse().unwrap(),
-    )(input)
+    ).parse(input)
 }
 
 pub fn parse_string(input: &str) -> IResult<&str, String> {
@@ -52,7 +52,7 @@ pub fn parse_string(input: &str) -> IResult<&str, String> {
         char('"'),
         map(take_while(|c| c != '"'), |s: &str| s.to_string()),
         char('"'),
-    )(input)
+    ).parse(input)
 }
 
 pub fn skip_comment(input: &str) -> IResult<&str, ()> {
@@ -60,17 +60,17 @@ pub fn skip_comment(input: &str) -> IResult<&str, ()> {
         // Line comment: // ...
         value((), pair(tag("//"), take_while(|c| c != '\n'))),
         // Block comment: /* ... */
-        value((), tuple((tag("/*"), take_until("*/"), tag("*/")))),
+        value((), (tag("/*"), take_until("*/"), tag("*/"))),
         // Hash comment: # ...
         value((), pair(tag("#"), take_while(|c| c != '\n'))),
-    ))(input)
+    )).parse(input)
 }
 
 pub fn skip_whitespace_and_comments(input: &str) -> IResult<&str, ()> {
     value((), many0(alt((
         value((), multispace1),
         skip_comment,
-    ))))(input)
+    )))).parse(input)
 }
 
 pub fn parse_token(input: &str) -> IResult<&str, Token> {
@@ -97,9 +97,9 @@ pub fn parse_token(input: &str) -> IResult<&str, Token> {
             map(char(':'), |_| Token::Colon),
             map(char('='), |_| Token::Equal),
         )),
-    )(input)
+    ).parse(input)
 }
 
 pub fn tokenize(input: &str) -> IResult<&str, Vec<Token>> {
-    many0(parse_token)(input)
+    many0(parse_token).parse(input)
 }
