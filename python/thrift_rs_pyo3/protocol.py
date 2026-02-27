@@ -1,5 +1,5 @@
 from typing import Any, Dict, IO
-from .thrift_rs_pyo3 import BinaryProtocol, ThriftStruct
+from .thrift_rs_pyo3 import BinaryProtocol, ThriftStruct, TransportType
 
 
 class TBinaryProtocol:
@@ -22,6 +22,29 @@ class TBinaryProtocolFactory:
 
     def get_protocol(self, trans):
         return TBinaryProtocol(trans)
+
+
+# ---------------------------------------------------------------------------
+# Transport helpers
+# ---------------------------------------------------------------------------
+
+class TFramedTransport:
+    """
+    Thin wrapper that tags a host/port pair as using framed transport
+    (TFramedTransport in the official Thrift SDKs).  Pass an instance of this
+    to ThriftServer instead of a raw (host, port) tuple to select the framed
+    transport mode explicitly.
+    """
+    transport_type = TransportType.Framed
+
+
+class TBufferedTransport:
+    """
+    Thin wrapper that tags a host/port pair as using buffered transport
+    (TBufferedTransport / TSocket in the official Thrift SDKs).  Pass an
+    instance of this to ThriftServer to select buffered (non-framed) mode.
+    """
+    transport_type = TransportType.Buffered
 
 
 # Convenience functions similar to thriftpy2 — call the Rust static methods directly

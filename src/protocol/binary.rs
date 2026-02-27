@@ -3,6 +3,20 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Read, Write, Result as IoResult, Cursor};
 use thiserror::Error;
 
+pub const MESSAGE_TYPE_CALL: u8 = 1;
+pub const MESSAGE_TYPE_REPLY: u8 = 2;
+pub const MESSAGE_TYPE_EXCEPTION: u8 = 3;
+pub const MESSAGE_TYPE_ONEWAY: u8 = 4;
+
+pub const THRIFT_VERSION_1: u32 = 0x80010000;
+
+#[derive(Debug, Clone)]
+pub struct MessageBegin {
+    pub name: String,
+    pub message_type: u8,
+    pub seq_id: i32,
+}
+
 #[derive(Error, Debug)]
 pub enum ProtocolError {
     #[error("IO error: {0}")]
@@ -146,6 +160,24 @@ impl<R: Read> BinaryProtocolReader<R> {
             size,
         })
     }
+
+    pub fn read_message_begin(&mut self) -> Result<MessageBegin, ProtocolError> {
+        let version_and_type = self.reader.read_u32::<BigEndian>()?;
+        if version_and_type & 0xffff0000 != THRIFT_VERSION_1 {
+            return Err(ProtocolError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Bad version: 0x{:08x}", version_and_type),
+            )));
+        }
+        let message_type = (version_and_type & 0x000000ff) as u8;
+        let name_len = self.reader.read_i32::<BigEndian>()? as usize;
+        let mut name_buf = vec![0u8; name_len];
+        self.reader.read_exact(&mut name_buf)?;
+        let name = String::from_utf8(name_buf)
+            .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let seq_id = self.reader.read_i32::<BigEndian>()?;
+        Ok(MessageBegin { name, message_type, seq_id })
+    }
 }
 
 pub struct BinaryProtocolWriter<W: Write> {
@@ -234,5 +266,15 @@ impl<W: Write> BinaryProtocolWriter<W> {
 
     pub fn flush(&mut self) -> IoResult<()> {
         self.writer.flush()
+    }
+
+    pub fn write_message_begin(&mut self, name: &str, message_type: u8, seq_id: i32) -> IoResult<()> {
+        let version_and_type = THRIFT_VERSION_1 | (message_type as u32);
+        self.writer.write_u32::<BigEndian>(version_and_type)?;
+        let name_bytes = name.as_bytes();
+        self.writer.write_i32::<BigEndian>(name_bytes.len() as i32)?;
+        self.writer.write_all(name_bytes)?;
+        self.writer.write_i32::<BigEndian>(seq_id)?;
+        Ok(())
     }
 }
