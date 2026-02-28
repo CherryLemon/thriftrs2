@@ -95,12 +95,12 @@ def start_rs_server(host: str, port: int) -> None:
         return ''.join(random.choices(string.ascii_lowercase, k=n))
 
     for i in range(1, 1001):
-        _db[i] = {
+        _db[i] = mod.User(**{
             "id": i,
             "name": f"user{ i }",
             "email": f"{_rand_str_local(6)}{i}@example.com",
             "age": random.randint(18, 80),
-        }
+        })
 
     # Handlers: keep get/create for compatibility but do not lock for list
     def handle_get_user(user_id: int):
@@ -417,9 +417,9 @@ def main() -> None:
         description='Concurrent Thrift RPC server benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-n', '--requests',    type=int, default=10000,
+    ap.add_argument('-n', '--requests',    type=int, default=2000,
                     help='Total requests per server (default: 2000)')
-    ap.add_argument('-c', '--concurrency', type=int, default=8,
+    ap.add_argument('-c', '--concurrency', type=int, default=30,
                     help='Concurrent client threads (default: 20)')
     ap.add_argument('--warmup',            type=int, default=200,
                     help='Warmup requests per server (default: 200)')

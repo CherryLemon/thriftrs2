@@ -21,22 +21,21 @@ import threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from thrift_rs_pyo3 import load, ThriftServer, TBufferedTransport
-
-# ---------------------------------------------------------------------------
-# In-memory "database"
-# ---------------------------------------------------------------------------
-_users: dict[int, dict] = {
-    1: {"id": 1, "name": "Alice", "email": "alice@example.com", "age": 30},
-    2: {"id": 2, "name": "Bob",   "email": "bob@example.com",   "age": 25},
-}
-_next_id = 3
-
 # ---------------------------------------------------------------------------
 # Load the .thrift definition (same file used by test.py)
 # ---------------------------------------------------------------------------
 THRIFT_FILE = os.path.join(os.path.dirname(__file__), "example.thrift")
 thrift_module = load(THRIFT_FILE)
 service_def = thrift_module._parser.get_service("UserService")
+User = thrift_module.User
+# ---------------------------------------------------------------------------
+# In-memory "database"
+# ---------------------------------------------------------------------------
+_users: dict[int, dict] = {
+    1: User(**{"id": 1, "name": "Alice", "email": "alice@example.com", "age": 30}),
+    2: User(**{"id": 2, "name": "Bob",   "email": "bob@example.com",   "age": 25}),
+}
+_next_id = 3
 
 # ---------------------------------------------------------------------------
 # Handler functions
@@ -57,7 +56,10 @@ def handle_get_user(user_id: int) -> dict | None:
 def handle_create_user(user: dict) -> bool:
     """Insert a new user; returns True on success."""
     global _next_id
-    uid = user.get("id", _next_id)
+    uid = user.id
+    if uid is None:
+        uid = _next_id
+        user.id = uid
     if uid in _users:
         print(f"  [server] create_user -> already exists id={uid}")
         return False
