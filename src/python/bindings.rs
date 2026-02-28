@@ -3,9 +3,11 @@ use pyo3::types::{PyDict, PyBytes, PyList};
 use pyo3::Py;
 use crate::parser::{Parser, ast::*};
 use crate::protocol::{BinaryProtocolReader, BinaryProtocolWriter, TType, FieldBegin,
-                      MESSAGE_TYPE_REPLY, MESSAGE_TYPE_EXCEPTION};
+                      MESSAGE_TYPE_REPLY, MESSAGE_TYPE_EXCEPTION,
+                      ListBegin, SetBegin, MapBegin};
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::Arc;
 use byteorder::BigEndian;
 // ──────────────────────────────────────────────────────────────────────────────
 // ThriftParser
@@ -58,6 +60,7 @@ impl ThriftParser {
                         name: s.name.clone(),
                         fields,
                         field_map,
+                        struct_map: Arc::new(HashMap::new()),
                     }
                 }))
             }
@@ -106,10 +109,13 @@ impl ThriftParser {
         }
     }
 
+}
+
+impl ThriftParser {
     /// Return a snapshot of the whole parsed document's struct map so the server
     /// can resolve nested struct types by name during serialisation/deserialisation.
-    pub(crate) fn struct_map(&self) -> HashMap<String, ThriftStruct> {
-        match &self.document {
+    pub(crate) fn struct_map(&self) -> Arc<HashMap<String, ThriftStruct>> {
+        let map: HashMap<String, ThriftStruct> = match &self.document {
             Some(doc) => doc.structs.iter().map(|(k, s)| {
                 let fields: Vec<ThriftField> = s.fields.iter().map(|f| ThriftField {
                     id: f.id,
@@ -121,10 +127,28 @@ impl ThriftParser {
                     .enumerate()
                     .map(|(idx, f)| (f.id, idx))
                     .collect();
-                (k.clone(), ThriftStruct { name: s.name.clone(), fields, field_map })
+                (k.clone(), ThriftStruct {
+                    name: s.name.clone(),
+                    fields,
+                    field_map,
+                    struct_map: Arc::new(HashMap::new()), // filled in below
+                })
             }).collect(),
             None => HashMap::new(),
-        }
+        };
+        // Now wrap in Arc and back-patch each ThriftStruct with the shared map.
+        let arc = Arc::new(map);
+        // Re-build with back-reference so ThriftStruct::new_instance can use it.
+        // We reconstruct a new map where every ThriftStruct has struct_map set.
+        let patched: HashMap<String, ThriftStruct> = arc.iter().map(|(k, s)| {
+            (k.clone(), ThriftStruct {
+                name: s.name.clone(),
+                fields: s.fields.clone(),
+                field_map: s.field_map.clone(),
+                struct_map: Arc::clone(&arc),
+            })
+        }).collect();
+        Arc::new(patched)
     }
 }
 
@@ -141,23 +165,83 @@ pub struct ThriftStruct {
     pub fields: Vec<ThriftField>,
     /// Cached map from field id -> index in `fields`, built once at parse time.
     field_map: HashMap<i16, usize>,
+    /// Shared map of all structs in the parsed document — used by new_instance
+    /// to give the created ThriftStructInstance schema-aware setattr coercion.
+    pub(crate) struct_map: Arc<HashMap<String, ThriftStruct>>,
 }
 
 #[pymethods]
 impl ThriftStruct {
-    pub fn serialize(&self, data: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
+    /// construct an empty ThriftStructInstance with all fields set to None.
+    pub fn new_instance(&self, _py: Python<'_>) -> ThriftStructInstance {
+        let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
+        let schema: HashMap<String, ThriftField> = self.fields.iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
+        ThriftStructInstance::empty(self.name.clone(), field_names, schema, Arc::clone(&self.struct_map))
+    }
+    pub fn new_instance_from_dict(&self, py: Python<'_>, items: &Bound<'_, PyDict>) -> ThriftStructInstance {
+        let field_names: Vec<String> = self.fields.iter().map(|f| f.name.clone()).collect();
+        let schema: HashMap<String, ThriftField> = self.fields.iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
+        let mut instance = ThriftStructInstance::empty(
+            self.name.clone(), field_names, schema.clone(), Arc::clone(&self.struct_map),
+        );
+        for (k, v) in items.iter() {
+            if let Ok(name) = k.extract::<String>() {
+                if instance.field_names.contains(&name) {
+                    // Populate cache (Python-visible)
+                    instance.cache.insert(name.clone(), v.clone().unbind());
+                    // Populate inner (GIL-free serialisation path), schema-aware
+                    let tv_result = if let Some(field) = schema.get(&name) {
+                        py_any_to_thrift_value_with_type(&v, &field.field_type.clone(), &self.struct_map)
+                    } else {
+                        py_any_to_thrift_value(&v)
+                    };
+                    if let Ok(tv) = tv_result {
+                        instance.inner.values.insert(name, tv);
+                    }
+                    let _ = py;
+                }
+            }
+        }
+        instance
+    }
+    #[pyo3(signature = (**kwargs))]
+    pub fn __call__(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> ThriftStructInstance {
+        let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
+        let schema: HashMap<String, ThriftField> = self.fields.iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
+        if let Some(kw) = kwargs {
+            self.new_instance_from_dict(py, kw)
+        } else {
+            ThriftStructInstance::empty(self.name.clone(), field_names, schema, Arc::clone(&self.struct_map))
+        }
+    }
+
+    /// Serialize a struct from either a `ThriftStructInstance` or a plain `dict`.
+    pub fn serialize(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
         let mut buffer = Vec::with_capacity(128 + self.fields.len() * 16);
         let mut writer = BinaryProtocolWriter::new(&mut buffer);
-        serialize_struct_fields(&mut writer, &self.fields, data, &HashMap::new())?;
+        serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
         writer.write_field_stop()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
         Ok(buffer)
     }
 
-    pub fn deserialize<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyDict>> {
+    /// Deserialize bytes into a `ThriftStructInstance`.
+    pub fn deserialize<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, ThriftStructInstance>> {
         let mut cursor = Cursor::new(data);
         let mut reader = BinaryProtocolReader::new(&mut cursor);
-        deserialize_struct_fields(&mut reader, &self.fields, &self.field_map, &HashMap::new(), py)
+        let schema: HashMap<String, ThriftField> = self.fields.iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
+        deserialize_struct_fields_as_instance(
+            &mut reader, &self.fields, &self.field_map,
+            &self.struct_map, py, &self.name, schema, Arc::clone(&self.struct_map),
+        )
     }
 
     pub fn __repr__(&self) -> String {
@@ -181,6 +265,216 @@ pub struct ThriftField {
 impl ThriftField {
     pub fn __repr__(&self) -> String {
         format!("ThriftField(id={}, name={:?}, required={}, field_type={:?})", self.id, self.name, self.required, self.field_type)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RustStructValue  –  GIL-free pure-Rust representation of a struct instance.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pure-Rust struct value produced during deserialisation without holding the
+/// GIL.  Absent keys mean the field was not present on the wire (None).
+#[derive(Clone)]
+pub struct RustStructValue {
+    pub struct_name: String,
+    pub field_names: Vec<String>,
+    pub values: HashMap<String, ThriftValue>,
+}
+
+impl RustStructValue {
+    pub fn empty(struct_name: String, field_names: Vec<String>) -> Self {
+        Self { struct_name, field_names, values: HashMap::new() }
+    }
+    pub fn set_field(&mut self, name: &str, value: ThriftValue) {
+        self.values.insert(name.to_string(), value);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ThriftStructInstance  –  Python-visible wrapper around RustStructValue.
+//
+// `cache` is authoritative for fields touched by Python.  Fields that have
+// never been touched by Python live only in `inner`.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A live instance of a Thrift struct.
+///
+/// Fields are accessible as Python attributes (``instance.field_name``).
+/// Unknown attribute names raise ``AttributeError``.
+#[pyclass]
+pub struct ThriftStructInstance {
+    #[pyo3(get)]
+    pub struct_name: String,
+    pub field_names: Vec<String>,
+    /// Pure-Rust inner store.  Populated at deserialisation time without GIL.
+    pub inner: RustStructValue,
+    /// Lazy Python-object cache.  A field enters the cache on first
+    /// `__getattr__` or `__setattr__`.  Serialisation checks cache first,
+    /// then falls back to `inner` (GIL-free path).
+    pub cache: HashMap<String, Py<PyAny>>,
+    /// Schema: field name → ThriftField, used by __setattr__ for type-aware coercion.
+    /// Empty for schemaless instances (created via #[new] without a ThriftStruct).
+    pub schema: HashMap<String, ThriftField>,
+    /// Shared struct map for resolving nested struct types in schema-aware coercion.
+    /// Empty (Arc pointing to empty HashMap) for schemaless instances.
+    pub struct_map: Arc<HashMap<String, ThriftStruct>>,
+}
+
+impl Clone for ThriftStructInstance {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            struct_name: self.struct_name.clone(),
+            field_names: self.field_names.clone(),
+            inner: self.inner.clone(),
+            cache: self.cache.iter()
+                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
+                .collect(),
+            schema: self.schema.clone(),
+            struct_map: Arc::clone(&self.struct_map),
+        })
+    }
+}
+
+impl ThriftStructInstance {
+    /// Construct from a pre-built `RustStructValue` with an empty cache,
+    /// and optionally a schema + struct_map for type-aware __setattr__ coercion.
+    pub fn from_rust(
+        inner: RustStructValue,
+        schema: HashMap<String, ThriftField>,
+        struct_map: Arc<HashMap<String, ThriftStruct>>,
+    ) -> Self {
+        let struct_name = inner.struct_name.clone();
+        let field_names = inner.field_names.clone();
+        Self { struct_name, field_names, inner, cache: HashMap::new(), schema, struct_map }
+    }
+
+    /// Construct an empty instance (no inner values, empty cache).
+    pub fn empty(
+        struct_name: String,
+        field_names: Vec<String>,
+        schema: HashMap<String, ThriftField>,
+        struct_map: Arc<HashMap<String, ThriftStruct>>,
+    ) -> Self {
+        let inner = RustStructValue::empty(struct_name.clone(), field_names.clone());
+        Self { struct_name, field_names, inner, cache: HashMap::new(), schema, struct_map }
+    }
+
+    /// Set a field value from a native `ThriftValue` (used during deser).
+    /// Does NOT touch the cache.
+    pub fn set_field(&mut self, name: &str, value: ThriftValue) {
+        self.inner.set_field(name, value);
+    }
+
+    /// Get a field as a Python object, populating the cache on first access.
+    pub fn get_field<'py>(&mut self, py: Python<'py>, name: &str) -> Option<Bound<'py, PyAny>> {
+        if !self.field_names.contains(&name.to_string()) {
+            return None;
+        }
+        if let Some(v) = self.cache.get(name) {
+            return Some(v.bind(py).clone());
+        }
+        let py_val = match self.inner.values.get(name) {
+            Some(tv) => thrift_value_to_py(tv, py).unwrap_or_else(|_| py.None()),
+            None => py.None(),
+        };
+        self.cache.insert(name.to_string(), py_val);
+        Some(self.cache[name].bind(py).clone())
+    }
+}
+
+#[pymethods]
+impl ThriftStructInstance {
+    #[new]
+    #[pyo3(signature = (struct_name, **kwargs))]
+    pub fn new(py: Python<'_>, struct_name: String, kwargs: Option<&Bound<'_, PyDict>>) -> Self {
+        let mut field_names = Vec::new();
+        let mut cache = HashMap::new();
+        if let Some(kw) = kwargs {
+            for (k, v) in kw.iter() {
+                if let Ok(name) = k.extract::<String>() {
+                    field_names.push(name.clone());
+                    cache.insert(name.clone(), v.unbind());
+                }
+            }
+        }
+        let _ = py;
+        let inner = RustStructValue {
+            struct_name: struct_name.clone(),
+            field_names: field_names.clone(),
+            values: HashMap::new(),
+        };
+        Self {
+            struct_name,
+            field_names,
+            inner,
+            cache,
+            schema: HashMap::new(),
+            struct_map: Arc::new(HashMap::new()),
+        }
+    }
+
+    pub fn __getattr__(&mut self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
+        if self.field_names.contains(&name.to_string()) {
+            Ok(self.get_field(py, name)
+                .map(|v| v.unbind())
+                .unwrap_or_else(|| py.None()))
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
+                format!("'{}' object has no attribute '{}'", self.struct_name, name),
+            ))
+        }
+    }
+
+    pub fn __setattr__(&mut self, py: Python<'_>, name: &str, value: Py<PyAny>) -> PyResult<()> {
+        if self.field_names.contains(&name.to_string()) {
+            // cache is authoritative
+            self.cache.insert(name.to_string(), value.clone_ref(py));
+            // keep inner in sync for GIL-free serialization; soft failure is OK
+            let bound = value.bind(py);
+            let tv_result = if let Some(field) = self.schema.get(name) {
+                // Schema-aware path: coerce to the exact ThriftValue variant.
+                py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), &self.struct_map)
+            } else {
+                // Schemaless fallback.
+                py_any_to_thrift_value(bound)
+            };
+            if let Ok(tv) = tv_result {
+                self.inner.values.insert(name.to_string(), tv);
+            } else {
+                self.inner.values.remove(name);
+            }
+            Ok(())
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
+                format!("'{}' object has no attribute '{}'", self.struct_name, name),
+            ))
+        }
+    }
+
+    pub fn __repr__(&mut self, py: Python<'_>) -> String {
+        let names = self.field_names.clone();
+        let fields: Vec<String> = names.iter().map(|name| {
+            let val = self.get_field(py, name)
+                .map(|v| format!("{:?}", v))
+                .unwrap_or_else(|| "None".to_string());
+            format!("{}={}", name, val)
+        }).collect();
+        format!("{}({})", self.struct_name, fields.join(", "))
+    }
+
+    pub fn to_dict<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        let names = self.field_names.clone();
+        for name in &names {
+            let v = self.get_field(py, name)
+                .unwrap_or_else(|| py.None().into_bound(py));
+            d.set_item(name, v)?;
+        }
+        Ok(d)
+    }
+
+    pub fn field_names(&self) -> Vec<String> {
+        self.field_names.clone()
     }
 }
 
@@ -243,8 +537,8 @@ impl BinaryProtocol {
     }
 
     #[staticmethod]
-    pub fn serialize_struct(struct_def: &ThriftStruct, data: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
-        struct_def.serialize(data)
+    pub fn serialize_struct(py: Python<'_>, struct_def: &ThriftStruct, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        struct_def.serialize(py, data)
     }
 
     #[staticmethod]
@@ -288,7 +582,8 @@ pub struct ThriftServer {
     handlers: HashMap<String, Py<PyAny>>,
     /// Snapshot of all structs from the parsed document, needed to resolve
     /// named struct types during handler argument de/serialisation.
-    struct_map: HashMap<String, ThriftStruct>,
+    /// Stored as Arc to allow clone-free sharing across spawned threads.
+    struct_map: Arc<HashMap<String, ThriftStruct>>,
     /// Transport type to use (framed or buffered).
     transport: TransportType,
 }
@@ -301,7 +596,7 @@ impl ThriftServer {
         Self {
             service,
             handlers: HashMap::new(),
-            struct_map: HashMap::new(),
+            struct_map: Arc::new(HashMap::new()),
             transport,
         }
     }
@@ -333,7 +628,6 @@ impl ThriftServer {
     /// Releases the GIL while waiting for connections.
     pub fn serve(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
         use std::net::TcpListener;
-        use std::sync::Arc;
 
         let addr = format!("{}:{}", host, port);
 
@@ -342,7 +636,7 @@ impl ThriftServer {
         let handlers: HashMap<String, Py<PyAny>> = self.handlers.iter()
             .map(|(k, v)| (k.clone(), v.clone_ref(py)))
             .collect();
-        let struct_map = self.struct_map.clone();
+        let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
 
         let listener = TcpListener::bind(&addr)
@@ -352,7 +646,6 @@ impl ThriftServer {
 
         let service = Arc::new(service);
         let handlers = Arc::new(handlers);
-        let struct_map = Arc::new(struct_map);
 
         // Release the GIL while blocking in accept loop.
         py.detach(|| {
@@ -380,14 +673,13 @@ impl ThriftServer {
     /// Returns immediately. The server keeps running until the process exits.
     pub fn serve_nonblocking(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
         use std::net::TcpListener;
-        use std::sync::Arc;
 
         let addr = format!("{}:{}", host, port);
         let service = self.service.clone();
         let handlers: HashMap<String, Py<PyAny>> = self.handlers.iter()
             .map(|(k, v)| (k.clone(), v.clone_ref(py)))
             .collect();
-        let struct_map = self.struct_map.clone();
+        let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
 
         let listener = TcpListener::bind(&addr)
@@ -397,7 +689,6 @@ impl ThriftServer {
 
         let service = Arc::new(service);
         let handlers = Arc::new(handlers);
-        let struct_map = Arc::new(struct_map);
 
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -426,10 +717,10 @@ impl ThriftServer {
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn handle_connection(
-    mut stream: std::net::TcpStream,
+    stream: std::net::TcpStream,
     service: &PyThriftService,
     handlers: &HashMap<String, Py<PyAny>>,
-    struct_map: &HashMap<String, ThriftStruct>,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
 ) -> std::io::Result<()> {
     use std::io::{Read, BufReader};
@@ -535,18 +826,28 @@ fn handle_connection(
                     1, &format!("Unknown method: {}", msg_begin.name))
             }
             Some(method) => {
-                // ── Deserialise arguments ─────────────────────────────────────
+                // ── Deserialise arguments  (GIL-free) ────────────────────────
                 let arg_field_map: HashMap<i16, usize> = method.arguments.iter()
                     .enumerate()
                     .map(|(i, f)| (f.id, i))
                     .collect();
 
-                let args_dict: Py<PyDict> = Python::attach(|py| {
-                    deserialize_struct_fields(&mut reader, &method.arguments, &arg_field_map, struct_map, py)
-                        .map(|d| d.unbind())
-                }).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                // Deserialise directly into RustStructValue — no Python objects.
+                let args_rust = deserialize_rust_struct(
+                    &mut reader,
+                    &method.arguments,
+                    &arg_field_map,
+                    struct_map,
+                ).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-                // ── Call Python handler ───────────────────────────────────────
+                // Give the RustStructValue the correct struct_name for the args.
+                let args_rust = RustStructValue {
+                    struct_name: format!("{}_args", msg_begin.name),
+                    field_names: args_rust.field_names,
+                    values: args_rust.values,
+                };
+
+                // ── Find handler (before entering GIL) ───────────────────────
                 let handler = match handlers.get(&msg_begin.name) {
                     Some(h) => h,
                     None => {
@@ -557,9 +858,36 @@ fn handle_connection(
                     }
                 };
 
+                // ── Single GIL block: bind args, call handler, serialise reply
                 let result: Result<Vec<u8>, String> = Python::attach(|py| {
-                    let py_args_dict = args_dict.bind(py);
-                    let result = handler.call(py, (), Option::from(py_args_dict))?;
+                    // Build schema from method arguments for type-aware __setattr__.
+                    let schema: HashMap<String, ThriftField> = method.arguments.iter()
+                        .map(|f| (f.name.clone(), f.clone()))
+                        .collect();
+                    // Wrap the RustStructValue in a ThriftStructInstance (no-copy inner move).
+                    let args_instance = ThriftStructInstance::from_rust(
+                        args_rust,
+                        schema,
+                        Arc::clone(struct_map),
+                    );
+                    let py_args = Bound::new(py, args_instance)?;
+
+                    // Build **kwargs dict mapping field name -> instance attribute.
+                    // We call the handler with the instance's fields as kwargs so
+                    // existing handler signatures (def method(self, arg1, arg2)) work.
+                    let kwargs = pyo3::types::PyDict::new(py);
+                    // Re-borrow so we can call get_field.
+                    let mut inst_borrow = py_args.borrow_mut();
+                    let field_names: Vec<String> = inst_borrow.field_names.clone();
+                    for name in &field_names {
+                        let val = inst_borrow.get_field(py, name)
+                            .map(|v| v.unbind())
+                            .unwrap_or_else(|| py.None());
+                        kwargs.set_item(name, val)?;
+                    }
+                    drop(inst_borrow);
+
+                    let result = handler.call(py, (), Some(&kwargs))?;
                     let reply_body = build_reply_body(py, &method.return_type, result.bind(py), struct_map)?;
                     Ok(build_reply_frame(&msg_begin.name, msg_begin.seq_id, &reply_body))
                 }).map_err(|e: PyErr| e.to_string());
@@ -735,7 +1063,7 @@ fn build_reply_body(
     writer.write_field_stop()
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     drop(writer);
-    let _ = py; // py is used implicitly by pyo3 error types above
+    let _ = py;
     Ok(buf)
 }
 
@@ -772,6 +1100,51 @@ fn build_exception_reply(method_name: &str, seq_id: i32, ex_type: i32, message: 
 // Helpers shared by ThriftStruct and server handler
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Serialise struct fields from either a `ThriftStructInstance` or a plain `PyDict`.
+pub(crate) fn serialize_struct_any<W: std::io::Write>(
+    writer: &mut BinaryProtocolWriter<W>,
+    fields: &[ThriftField],
+    data: &Bound<'_, PyAny>,
+    struct_map: &HashMap<String, ThriftStruct>,
+    py: Python<'_>,
+) -> PyResult<()> {
+    if let Ok(instance) = data.cast::<ThriftStructInstance>() {
+        let instance = instance.borrow();
+        for field in fields {
+            // Fast path: field is in the Python cache — use the existing GIL path.
+            if let Some(py_val) = instance.cache.get(&field.name) {
+                let bound = py_val.bind(py);
+                if !bound.is_none() {
+                    let field_begin = FieldBegin {
+                        name: None,
+                        field_type: thrift_type_to_ttype(&field.field_type),
+                        id: field.id,
+                    };
+                    writer.write_field_begin(&field_begin)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+                    write_value_with_structs(writer, &field.field_type, bound, struct_map)?;
+                }
+            } else if let Some(tv) = instance.inner.values.get(&field.name) {
+                // GIL-free path: field is in inner but was never touched by Python.
+                let field_begin = FieldBegin {
+                    name: None,
+                    field_type: thrift_type_to_ttype(&field.field_type),
+                    id: field.id,
+                };
+                writer.write_field_begin(&field_begin)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+                write_thrift_value(writer, tv, struct_map)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+            }
+            // else: field absent in both cache and inner — skip (None)
+        }
+        Ok(())
+    } else {
+        let dict = data.cast::<PyDict>()?;
+        serialize_struct_fields(writer, fields, dict, struct_map)
+    }
+}
+
 pub(crate) fn serialize_struct_fields<W: std::io::Write>(
     writer: &mut BinaryProtocolWriter<W>,
     fields: &[ThriftField],
@@ -793,6 +1166,7 @@ pub(crate) fn serialize_struct_fields<W: std::io::Write>(
     Ok(())
 }
 
+#[allow(dead_code)]
 pub(crate) fn deserialize_struct_fields<'py, R: std::io::Read>(
     reader: &mut BinaryProtocolReader<R>,
     fields: &[ThriftField],
@@ -817,6 +1191,234 @@ pub(crate) fn deserialize_struct_fields<'py, R: std::io::Read>(
         }
     }
     Ok(result)
+}
+
+/// Deserialise struct fields into a `ThriftStructInstance`.
+pub(crate) fn deserialize_struct_fields_as_instance<'py, R: std::io::Read>(
+    reader: &mut BinaryProtocolReader<R>,
+    fields: &[ThriftField],
+    field_map: &HashMap<i16, usize>,
+    struct_map: &HashMap<String, ThriftStruct>,
+    py: Python<'py>,
+    struct_name: &str,
+    schema: HashMap<String, ThriftField>,
+    struct_map_arc: Arc<HashMap<String, ThriftStruct>>,
+) -> PyResult<Bound<'py, ThriftStructInstance>> {
+    let mut rust_val = deserialize_rust_struct(reader, fields, field_map, struct_map)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
+    rust_val.struct_name = struct_name.to_string();
+    let instance = ThriftStructInstance::from_rust(rust_val, schema, struct_map_arc);
+    Ok(Bound::new(py, instance)?)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GIL-free deserialisation  (bytes → ThriftValue / RustStructValue)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Read a single Thrift value from the wire into a `ThriftValue`, entirely
+/// without touching the GIL.  Nested structs are represented as
+/// `ThriftValue::Struct { name, fields }`.
+pub(crate) fn read_rust_value<R: std::io::Read>(
+    reader: &mut BinaryProtocolReader<R>,
+    thrift_type: &ThriftType,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> std::io::Result<ThriftValue> {
+    match thrift_type {
+        ThriftType::Bool => Ok(ThriftValue::Bool(reader.read_bool()?)),
+        ThriftType::Byte => Ok(ThriftValue::Byte(reader.read_byte()?)),
+        ThriftType::I16  => Ok(ThriftValue::I16(reader.read_i16()?)),
+        ThriftType::I32  => Ok(ThriftValue::I32(reader.read_i32()?)),
+        ThriftType::I64  => Ok(ThriftValue::I64(reader.read_i64()?)),
+        ThriftType::Double => Ok(ThriftValue::Double(reader.read_double()?)),
+        ThriftType::String => Ok(ThriftValue::String(reader.read_string()?)),
+        ThriftType::Binary => Ok(ThriftValue::Binary(reader.read_binary()?)),
+        ThriftType::List(elem_type) => {
+            let lb = reader.read_list_begin()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut items = Vec::with_capacity(lb.size as usize);
+            for _ in 0..lb.size {
+                items.push(read_rust_value(reader, elem_type, struct_map)?);
+            }
+            Ok(ThriftValue::List(items))
+        }
+        ThriftType::Set(elem_type) => {
+            let sb = reader.read_set_begin()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut items = Vec::with_capacity(sb.size as usize);
+            for _ in 0..sb.size {
+                items.push(read_rust_value(reader, elem_type, struct_map)?);
+            }
+            Ok(ThriftValue::Set(items))
+        }
+        ThriftType::Map(key_type, val_type) => {
+            let mb = reader.read_map_begin()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut pairs = Vec::with_capacity(mb.size as usize);
+            for _ in 0..mb.size {
+                let k = read_rust_value(reader, key_type, struct_map)?;
+                let v = read_rust_value(reader, val_type, struct_map)?;
+                pairs.push((k, v));
+            }
+            Ok(ThriftValue::Map(pairs))
+        }
+        ThriftType::Struct(struct_name) => {
+            let struct_def = struct_map.get(struct_name)
+                .ok_or_else(|| std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown struct type: {}", struct_name),
+                ))?;
+            let fm: HashMap<i16, usize> = struct_def.fields.iter()
+                .enumerate().map(|(i, f)| (f.id, i)).collect();
+            let nested = deserialize_rust_struct(reader, &struct_def.fields, &fm, struct_map)?;
+            Ok(ThriftValue::Struct {
+                name: Some(struct_name.clone()),
+                fields: nested.values,
+            })
+        }
+    }
+}
+
+/// Deserialise Thrift struct fields from the wire into a `RustStructValue`,
+/// entirely without touching the GIL.
+pub(crate) fn deserialize_rust_struct<R: std::io::Read>(
+    reader: &mut BinaryProtocolReader<R>,
+    fields: &[ThriftField],
+    field_map: &HashMap<i16, usize>,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> std::io::Result<RustStructValue> {
+    let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+    let mut result = RustStructValue {
+        struct_name: String::new(),   // caller sets struct_name if needed
+        field_names,
+        values: HashMap::new(),
+    };
+    loop {
+        let field_begin = reader.read_field_begin()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        if field_begin.field_type == TType::Stop {
+            break;
+        }
+        if let Some(&idx) = field_map.get(&field_begin.id) {
+            let field = &fields[idx];
+            let value = read_rust_value(reader, &field.field_type, struct_map)?;
+            result.values.insert(field.name.clone(), value);
+        } else {
+            skip_value(reader, field_begin.field_type)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        }
+    }
+    Ok(result)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GIL-free serialisation  (ThriftValue → wire bytes)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Serialise a `ThriftValue` directly to the wire without touching the GIL.
+/// Used by `serialize_struct_any` for fields that are in `inner` but have
+/// never been promoted to the Python cache.
+pub(crate) fn write_thrift_value<W: std::io::Write>(
+    writer: &mut BinaryProtocolWriter<W>,
+    val: &ThriftValue,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> std::io::Result<()> {
+    match val {
+        ThriftValue::Bool(v)   => writer.write_bool(*v),
+        ThriftValue::Byte(v)   => writer.write_byte(*v),
+        ThriftValue::I16(v)    => writer.write_i16(*v),
+        ThriftValue::I32(v)    => writer.write_i32(*v),
+        ThriftValue::I64(v)    => writer.write_i64(*v),
+        ThriftValue::Double(v) => writer.write_double(*v),
+        ThriftValue::String(v) => writer.write_string(v),
+        ThriftValue::Binary(v) => writer.write_binary(v),
+        ThriftValue::List(items) => {
+            let elem_ttype = items.first().map(|v| thrift_value_ttype(v)).unwrap_or(TType::String);
+            writer.write_list_begin(&crate::protocol::ListBegin {
+                element_type: elem_ttype,
+                size: items.len() as i32,
+            })?;
+            for item in items {
+                write_thrift_value(writer, item, struct_map)?;
+            }
+            Ok(())
+        }
+        ThriftValue::Set(items) => {
+            let elem_ttype = items.first().map(|v| thrift_value_ttype(v)).unwrap_or(TType::String);
+            writer.write_set_begin(&crate::protocol::SetBegin {
+                element_type: elem_ttype,
+                size: items.len() as i32,
+            })?;
+            for item in items {
+                write_thrift_value(writer, item, struct_map)?;
+            }
+            Ok(())
+        }
+        ThriftValue::Map(pairs) => {
+            let (kt, vt) = pairs.first()
+                .map(|(k, v)| (thrift_value_ttype(k), thrift_value_ttype(v)))
+                .unwrap_or((TType::String, TType::String));
+            writer.write_map_begin(&crate::protocol::MapBegin {
+                key_type: kt,
+                value_type: vt,
+                size: pairs.len() as i32,
+            })?;
+            for (k, v) in pairs {
+                write_thrift_value(writer, k, struct_map)?;
+                write_thrift_value(writer, v, struct_map)?;
+            }
+            Ok(())
+        }
+        ThriftValue::Struct { name, fields } => {
+            // Write each field in definition order if we know the struct def,
+            // otherwise fall back to arbitrary key order.
+            let ordered_fields: Vec<(&String, &ThriftValue)> = if let Some(sname) = name {
+                if let Some(def) = struct_map.get(sname) {
+                    def.fields.iter()
+                        .filter_map(|fd| fields.get(&fd.name).map(|v| (&fd.name, v)))
+                        .collect()
+                } else {
+                    fields.iter().collect()
+                }
+            } else {
+                fields.iter().collect()
+            };
+
+            // Look up field ids from the struct_map so we write correct wire ids.
+            let struct_def = name.as_deref().and_then(|n| struct_map.get(n));
+
+            for (fname, fval) in &ordered_fields {
+                let field_id: i16 = struct_def
+                    .and_then(|def| def.fields.iter().find(|f| &f.name == *fname))
+                    .map(|f| f.id)
+                    .unwrap_or(0);
+                let ttype = thrift_value_ttype(fval);
+                let field_begin = crate::protocol::FieldBegin { name: None, field_type: ttype, id: field_id };
+                writer.write_field_begin(&field_begin)?;
+                write_thrift_value(writer, fval, struct_map)?;
+            }
+            writer.write_field_stop()?;
+            Ok(())
+        }
+    }
+}
+
+/// Derive the `TType` wire tag from a `ThriftValue` without schema info.
+#[inline]
+fn thrift_value_ttype(val: &ThriftValue) -> TType {
+    match val {
+        ThriftValue::Bool(_)   => TType::Bool,
+        ThriftValue::Byte(_)   => TType::Byte,
+        ThriftValue::I16(_)    => TType::I16,
+        ThriftValue::I32(_)    => TType::I32,
+        ThriftValue::I64(_)    => TType::I64,
+        ThriftValue::Double(_) => TType::Double,
+        ThriftValue::String(_) => TType::String,
+        ThriftValue::Binary(_) => TType::String,
+        ThriftValue::List(_)   => TType::List,
+        ThriftValue::Set(_)    => TType::Set,
+        ThriftValue::Map(_)    => TType::Map,
+        ThriftValue::Struct { .. } => TType::Struct,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -922,8 +1524,8 @@ fn write_value_with_structs<'py, W: std::io::Write>(
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     format!("Unknown struct type: {}", struct_name))
             })?;
-            let dict = value.cast::<PyDict>()?;
-            serialize_struct_fields(writer, &struct_def.fields, dict, struct_map)?;
+            let py = value.py();
+            serialize_struct_any(writer, &struct_def.fields, value, struct_map, py)?;
             writer.write_field_stop()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
@@ -931,6 +1533,7 @@ fn write_value_with_structs<'py, W: std::io::Write>(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn read_value_with_structs<'py, R: std::io::Read>(
     reader: &mut BinaryProtocolReader<R>,
     thrift_type: &ThriftType,
@@ -1014,8 +1617,14 @@ fn read_value_with_structs<'py, R: std::io::Read>(
             })?;
             let fm: HashMap<i16, usize> = struct_def.fields.iter()
                 .enumerate().map(|(i, f)| (f.id, i)).collect();
-            let dict = deserialize_struct_fields(reader, &struct_def.fields, &fm, struct_map, py)?;
-            Ok(dict.into_any().unbind())
+            let schema: HashMap<String, ThriftField> = struct_def.fields.iter()
+                .map(|f| (f.name.clone(), f.clone()))
+                .collect();
+            let instance = deserialize_struct_fields_as_instance(
+                reader, &struct_def.fields, &fm, struct_map, py, struct_name,
+                schema, struct_def.struct_map.clone(),
+            )?;
+            Ok(instance.into_any().unbind())
         }
     }
 }
@@ -1060,3 +1669,240 @@ fn skip_value<R: std::io::Read>(
     }
     Ok(())
 }
+
+/// Convert a `ThriftValue` to a Python object.  Nested structs become
+/// `ThriftStructInstance` with `inner` pre-populated and an empty cache.
+pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    match val {
+        ThriftValue::Bool(v)   => Ok(v.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
+        ThriftValue::Byte(v)   => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I16(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I32(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I64(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::Double(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::String(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::Binary(v) => Ok(PyBytes::new(py, v).into_any().unbind()),
+        ThriftValue::List(items) | ThriftValue::Set(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(thrift_value_to_py(item, py)?.bind(py))?;
+            }
+            Ok(list.into_any().unbind())
+        }
+        ThriftValue::Map(pairs) => {
+            let d = PyDict::new(py);
+            for (k, v) in pairs {
+                d.set_item(
+                    thrift_value_to_py(k, py)?.bind(py),
+                    thrift_value_to_py(v, py)?.bind(py),
+                )?;
+            }
+            Ok(d.into_any().unbind())
+        }
+        ThriftValue::Struct { name, fields } => {
+            let field_names: Vec<String> = fields.keys().cloned().collect();
+            let struct_name = name.clone().unwrap_or_default();
+            let inner = RustStructValue {
+                struct_name: struct_name.clone(),
+                field_names: field_names.clone(),
+                values: fields.clone(),
+            };
+            let instance = ThriftStructInstance::from_rust(inner, HashMap::new(), Arc::new(HashMap::new()));
+            Ok(Bound::new(py, instance)?.into_any().unbind())
+        }
+    }
+}
+
+/// Best-effort conversion of an arbitrary Python object to a `ThriftValue`
+/// without schema type information.  Used by `__setattr__` to keep `inner`
+/// in sync.  Returns `Err` for values that cannot be represented (e.g. None).
+pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftValue> {
+    if val.is_none() {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("None has no ThriftValue representation"));
+    }
+    // bool must come before i64 because Python bool is a subclass of int.
+    if let Ok(v) = val.extract::<bool>() {
+        return Ok(ThriftValue::Bool(v));
+    }
+    if let Ok(v) = val.extract::<i64>() {
+        return Ok(ThriftValue::I64(v));
+    }
+    if let Ok(v) = val.extract::<f64>() {
+        return Ok(ThriftValue::Double(v));
+    }
+    if let Ok(v) = val.extract::<String>() {
+        return Ok(ThriftValue::String(v));
+    }
+    if let Ok(v) = val.extract::<Vec<u8>>() {
+        return Ok(ThriftValue::Binary(v));
+    }
+    if let Ok(list) = val.cast::<PyList>() {
+        let items: PyResult<Vec<ThriftValue>> = list.iter()
+            .map(|i| py_any_to_thrift_value(&i))
+            .collect();
+        return Ok(ThriftValue::List(items?));
+    }
+    if let Ok(dict) = val.cast::<PyDict>() {
+        let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict.iter()
+            .map(|(k, v)| Ok((py_any_to_thrift_value(&k)?, py_any_to_thrift_value(&v)?)))
+            .collect();
+        return Ok(ThriftValue::Map(pairs?));
+    }
+    if let Ok(inst) = val.cast::<ThriftStructInstance>() {
+        let inst = inst.borrow();
+        let mut fields = inst.inner.values.clone();
+        // Cache entries override inner — use schema-aware coercion when available.
+        let has_schema = !inst.schema.is_empty();
+        for name in &inst.field_names {
+            if let Some(py_val) = inst.cache.get(name) {
+                let bound = py_val.bind(val.py());
+                let tv_result = if has_schema {
+                    if let Some(field) = inst.schema.get(name) {
+                        py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), &inst.struct_map)
+                    } else {
+                        py_any_to_thrift_value(bound)
+                    }
+                } else {
+                    py_any_to_thrift_value(bound)
+                };
+                if let Ok(tv) = tv_result {
+                    fields.insert(name.clone(), tv);
+                }
+            }
+        }
+        return Ok(ThriftValue::Struct {
+            name: Some(inst.struct_name.clone()),
+            fields,
+        });
+    }
+    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+        format!("Cannot convert Python value of type '{}' to ThriftValue",
+            val.get_type().qualname()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string())),
+    ))
+}
+
+/// Schema-aware conversion of a Python value to the exact `ThriftValue` variant
+/// dictated by `thrift_type`.  Falls back to `py_any_to_thrift_value` for
+/// primitive scalars where the schema just confirms the obvious mapping.
+pub(crate) fn py_any_to_thrift_value_with_type(
+    val: &Bound<'_, PyAny>,
+    thrift_type: &ThriftType,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+) -> PyResult<ThriftValue> {
+    if val.is_none() {
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("None has no ThriftValue representation"));
+    }
+    match thrift_type {
+        ThriftType::Bool => {
+            Ok(ThriftValue::Bool(val.extract::<bool>()?))
+        }
+        ThriftType::Byte => {
+            Ok(ThriftValue::Byte(val.extract::<i8>()?))
+        }
+        ThriftType::I16 => {
+            // Python int can always fit in i16 if the value is in range.
+            Ok(ThriftValue::I16(val.extract::<i16>()?))
+        }
+        ThriftType::I32 => {
+            Ok(ThriftValue::I32(val.extract::<i32>()?))
+        }
+        ThriftType::I64 => {
+            Ok(ThriftValue::I64(val.extract::<i64>()?))
+        }
+        ThriftType::Double => {
+            Ok(ThriftValue::Double(val.extract::<f64>()?))
+        }
+        ThriftType::String => {
+            Ok(ThriftValue::String(val.extract::<String>()?))
+        }
+        ThriftType::Binary => {
+            Ok(ThriftValue::Binary(val.extract::<Vec<u8>>()?))
+        }
+        ThriftType::List(elem_type) => {
+            let list = val.cast::<PyList>()?;
+            let items: PyResult<Vec<ThriftValue>> = list.iter()
+                .map(|i| py_any_to_thrift_value_with_type(&i, elem_type, struct_map))
+                .collect();
+            Ok(ThriftValue::List(items?))
+        }
+        ThriftType::Set(elem_type) => {
+            let list = val.cast::<PyList>()?;
+            let items: PyResult<Vec<ThriftValue>> = list.iter()
+                .map(|i| py_any_to_thrift_value_with_type(&i, elem_type, struct_map))
+                .collect();
+            Ok(ThriftValue::Set(items?))
+        }
+        ThriftType::Map(key_type, val_type) => {
+            let dict = val.cast::<PyDict>()?;
+            let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict.iter()
+                .map(|(k, v)| Ok((
+                    py_any_to_thrift_value_with_type(&k, key_type, struct_map)?,
+                    py_any_to_thrift_value_with_type(&v, val_type, struct_map)?,
+                )))
+                .collect();
+            Ok(ThriftValue::Map(pairs?))
+        }
+        ThriftType::Struct(struct_name) => {
+            if let Ok(inst) = val.cast::<ThriftStructInstance>() {
+                let inst = inst.borrow();
+                // Resolve field schema from local instance or global struct_map.
+                let schema: Option<&ThriftStruct> = struct_map.get(struct_name.as_str());
+                let mut fields = inst.inner.values.clone();
+                for name in &inst.field_names {
+                    if let Some(py_val) = inst.cache.get(name) {
+                        let bound = py_val.bind(val.py());
+                        // Use schema from global struct_map for coercion if available.
+                        let tv_result = if let Some(def) = schema {
+                            if let Some(field) = def.fields.iter().find(|f| f.name == *name) {
+                                py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), struct_map)
+                            } else {
+                                py_any_to_thrift_value(bound)
+                            }
+                        } else if let Some(field) = inst.schema.get(name) {
+                            py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), &inst.struct_map)
+                        } else {
+                            py_any_to_thrift_value(bound)
+                        };
+                        if let Ok(tv) = tv_result {
+                            fields.insert(name.clone(), tv);
+                        }
+                    }
+                }
+                Ok(ThriftValue::Struct {
+                    name: Some(inst.struct_name.clone()),
+                    fields,
+                })
+            } else if let Ok(dict) = val.cast::<PyDict>() {
+                // Plain dict: use struct_map for coercion if available.
+                let schema_def = struct_map.get(struct_name.as_str());
+                let mut fields: HashMap<String, ThriftValue> = HashMap::new();
+                for (k, v) in dict.iter() {
+                    let field_name: String = k.extract()?;
+                    let tv = if let Some(def) = schema_def {
+                        if let Some(field) = def.fields.iter().find(|f| f.name == field_name) {
+                            py_any_to_thrift_value_with_type(&v, &field.field_type.clone(), struct_map)
+                                .unwrap_or_else(|_| py_any_to_thrift_value(&v).unwrap_or(ThriftValue::String(String::new())))
+                        } else {
+                            py_any_to_thrift_value(&v)
+                                .unwrap_or(ThriftValue::String(String::new()))
+                        }
+                    } else {
+                        py_any_to_thrift_value(&v)?
+                    };
+                    fields.insert(field_name, tv);
+                }
+                Ok(ThriftValue::Struct {
+                    name: Some(struct_name.clone()),
+                    fields,
+                })
+            } else {
+                // Fall back to schemaless conversion.
+                py_any_to_thrift_value(val)
+            }
+        }
+    }
+}
+
+

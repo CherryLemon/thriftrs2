@@ -59,7 +59,7 @@ pub enum ThriftValue {
     List(Vec<ThriftValue>),
     Set(Vec<ThriftValue>),
     Map(Vec<(ThriftValue, ThriftValue)>),
-    Struct(HashMap<String, ThriftValue>),
+    Struct { name: Option<String>, fields: HashMap<String, ThriftValue> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,6 +1,6 @@
 import os
 from typing import Dict, Any, Optional
-from .thrift_rs_pyo3 import ThriftParser
+from .thrift_rs_pyo3 import ThriftParser, PyThriftService
 
 
 class ThriftModule:
@@ -29,6 +29,16 @@ class ThriftModule:
         if name in self._services:
             return self._services[name]
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+    def create_service(self, service_name: str, handlers: Dict[str, Any]):
+        """Create a service instance with the given handlers"""
+        service_def = self._parser.get_service(service_name)
+        if not service_def:
+            raise ValueError(f"Service '{service_name}' not found in thrift definitions")
+        service_instance = PyThriftService(service_def, handlers)
+        self._services[service_name] = service_instance
+        setattr(self, service_name, service_instance)
+        return service_instance
 
 
 def load(thrift_file: str, module_name: Optional[str] = None, include_dirs: Optional[list] = None) -> ThriftModule:

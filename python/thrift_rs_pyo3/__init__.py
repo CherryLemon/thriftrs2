@@ -7,6 +7,7 @@ from .thrift_rs_pyo3 import (
     PyThriftMethod,
     ThriftServer,
     TransportType,
+    ThriftStructInstance
 )
 from .loader import load
 from .protocol import TBinaryProtocol, TFramedTransport, TBufferedTransport, serialize, deserialize
@@ -21,6 +22,7 @@ __all__ = [
     "PyThriftMethod",
     "ThriftServer",
     "TransportType",
+    "ThriftStructInstance",
     "TFramedTransport",
     "TBufferedTransport",
     "load",
