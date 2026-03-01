@@ -105,12 +105,6 @@ def make_client(
     transport : TransportType
         ``TransportType.Framed`` or ``TransportType.Buffered``
         (default ``Buffered``).
-    service_name : str, optional
-        Only needed when *service* is a :class:`ThriftModule` that defines
-        more than one service.
-    parser : ThriftParser, optional
-        Override the parser used for nested struct resolution.  When *service*
-        is a :class:`ThriftModule` the module's own parser is used automatically.
 
     Returns
     -------
@@ -158,14 +152,8 @@ def make_server(
     transport : TransportType
         ``TransportType.Framed`` or ``TransportType.Buffered``
         (default ``Buffered``).
-    service_name : str, optional
-        Only needed when *service* is a :class:`ThriftModule` that defines
-        more than one service.
     workers : int
         Number of worker threads (default ``1``).
-    parser : ThriftParser, optional
-        Override the parser used for nested struct resolution.  When *service*
-        is a :class:`ThriftModule` the module's own parser is used automatically.
 
     Returns
     -------

@@ -16,7 +16,7 @@ use tokio::net::{TcpListener, TcpStream};
 use super::parser::ThriftParser;
 use super::serde::{deserialize_rust_struct, thrift_type_to_ttype, write_value_with_structs};
 use super::types::{
-    PyThriftService, RustStructValue, ThriftField, ThriftStruct, ThriftStructInstance,
+    PyThriftService, ThriftField, ThriftStruct, ThriftStructInstance,
     TransportType,
 };
 
@@ -281,11 +281,9 @@ async fn handle_connection(
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                 })?;
 
-                let args_rust = RustStructValue {
-                    struct_name: format!("{}_args", msg_begin.name),
-                    field_names: args_rust.field_names,
-                    values: args_rust.values,
-                };
+                let args_struct_name = format!("{}_args", msg_begin.name);
+                let args_field_names = args_rust.field_names;
+                let args_values = args_rust.values;
 
                 if !handlers.contains_key(&msg_begin.name) {
                     let payload = build_exception_reply(
@@ -314,13 +312,15 @@ async fn handle_connection(
                                 .expect("handler checked above")
                                 .clone_ref(py);
 
-                            let schema: HashMap<String, ThriftField> = method
+                            let schema: Arc<HashMap<String, ThriftField>> = Arc::new(method
                                 .arguments
                                 .iter()
                                 .map(|f| (f.name.clone(), f.clone()))
-                                .collect();
+                                .collect());
                             let args_instance = ThriftStructInstance::from_rust(
-                                args_rust,
+                                args_struct_name,
+                                Arc::new(args_field_names),
+                                args_values,
                                 schema,
                                 Arc::clone(&struct_map2),
                             );
@@ -329,7 +329,7 @@ async fn handle_connection(
                             let kwargs = PyDict::new(py);
                             let mut inst_borrow = py_args.borrow_mut();
                             let field_names: Vec<String> =
-                                inst_borrow.field_names.clone();
+                                inst_borrow.field_names.as_ref().clone();
                             for name in &field_names {
                                 let val = inst_borrow
                                     .get_field(py, name)

@@ -24,7 +24,7 @@ THRIFT_FILE = os.path.join(os.path.dirname(__file__), "example.thrift")
 def main():
     # ── Load the .thrift definition ──────────────────────────────────────────
     thrift_module = load(THRIFT_FILE)
-    service_def = thrift_module._parser.get_service("UserService")
+    service_def = thrift_module.UserService
     User = thrift_module.User
 
     # ── Connect to the server ────────────────────────────────────────────────
@@ -35,7 +35,6 @@ def main():
         "127.0.0.1",
         9090,
         TBufferedTransport.transport_type,
-        parser=thrift_module._parser,
     ) as client:
 
         # ── get_user(user_id=1) → User ───────────────────────────────────────

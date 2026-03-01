@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 
 use super::parser::ThriftParser;
 use super::serde::{
-    read_rust_value, skip_value, thrift_type_to_ttype, thrift_value_to_py,
+    read_value_with_structs, skip_value, thrift_type_to_ttype,
     write_value_with_structs,
 };
 use super::types::{PyThriftService, ThriftStruct, TransportType};
@@ -80,6 +80,8 @@ pub struct ThriftClient {
     port: u16,
     conn: Mutex<Option<Connection>>,
     seq_id: AtomicI32,
+    /// Pre-computed method name -> index in service.methods for O(1) lookup.
+    method_index: HashMap<String, usize>,
     /// Each ThriftClient owns its own single-threaded Tokio runtime so that
     /// `open` / `call` / `close` can be called from any Python thread without
     /// requiring a running async context.
@@ -105,6 +107,12 @@ impl ThriftClient {
                     e
                 ))
             })?;
+        let method_index: HashMap<String, usize> = service
+            .methods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.clone(), i))
+            .collect();
         Ok(Self {
             service,
             struct_map: Arc::new(HashMap::new()),
@@ -113,6 +121,7 @@ impl ThriftClient {
             port,
             conn: Mutex::new(None),
             seq_id: AtomicI32::new(0),
+            method_index,
             rt,
         })
     }
@@ -181,22 +190,18 @@ impl ThriftClient {
         method_name: &str,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
-        let method = self
-            .service
-            .methods
-            .iter()
-            .find(|m| m.name == method_name)
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Unknown method: {}",
-                    method_name
-                ))
-            })?
-            .clone();
+        // O(1) method lookup via pre-computed index map.
+        let method_idx = self.method_index.get(method_name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Unknown method: {}",
+                method_name
+            ))
+        })?;
+        let method = &self.service.methods[*method_idx];
 
         let seq_id = self.seq_id.fetch_add(1, Ordering::Relaxed);
 
-        // ── Phase 1: serialise the call frame (needs GIL for PyAny access) ────
+        // ── Phase 1: serialise the call frame in a single writer pass ─────────
         let call_frame: Vec<u8> = {
             let empty_dict;
             let kw: &Bound<'_, PyDict> = if let Some(k) = kwargs {
@@ -207,42 +212,37 @@ impl ThriftClient {
             };
 
             let mut buf = Vec::with_capacity(256);
-            {
-                let mut writer = BinaryProtocolWriter::new(&mut buf);
+            let mut writer = BinaryProtocolWriter::new(&mut buf);
+            writer
+                .write_message_begin(&MessageBegin {
+                    name: method_name.to_string(),
+                    message_type: MESSAGE_TYPE_CALL,
+                    seq_id,
+                })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            for field in &method.arguments {
+                let value = match kw.get_item(&field.name)? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let fb = FieldBegin {
+                    name: None,
+                    field_type: thrift_type_to_ttype(&field.field_type),
+                    id: field.id,
+                };
                 writer
-                    .write_message_begin(&MessageBegin {
-                        name: method_name.to_string(),
-                        message_type: MESSAGE_TYPE_CALL,
-                        seq_id,
-                    })
+                    .write_field_begin(&fb)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                write_value_with_structs(
+                    &mut writer,
+                    &field.field_type,
+                    &value,
+                    &self.struct_map,
+                )?;
             }
-            {
-                let mut writer = BinaryProtocolWriter::new(&mut buf);
-                for field in &method.arguments {
-                    let value = match kw.get_item(&field.name)? {
-                        Some(v) => v,
-                        None => continue,
-                    };
-                    let fb = FieldBegin {
-                        name: None,
-                        field_type: thrift_type_to_ttype(&field.field_type),
-                        id: field.id,
-                    };
-                    writer
-                        .write_field_begin(&fb)
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-                    write_value_with_structs(
-                        &mut writer,
-                        &field.field_type,
-                        &value,
-                        &self.struct_map,
-                    )?;
-                }
-                writer
-                    .write_field_stop()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            }
+            writer
+                .write_field_stop()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             buf
         };
 
@@ -266,7 +266,7 @@ impl ThriftClient {
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e))?;
 
-        // ── Phase 3: decode reply (needs GIL for Python object creation) ───────
+        // ── Phase 3: decode reply directly into Python objects ────────────────
         let mut cursor = Cursor::new(&reply_payload[..]);
         let mut reader = BinaryProtocolReader::new(&mut cursor);
 
@@ -291,12 +291,9 @@ impl ThriftClient {
         }
 
         if field_begin.id != 0 {
-            let ex_val = read_rust_value(&mut reader, &return_type, &struct_map)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()));
-            let ex_py = match ex_val {
-                Ok(tv) => thrift_value_to_py(&tv, py)?,
-                Err(_) => py.None(),
-            };
+            // Service exception in a non-zero field slot — read and discard.
+            let ex_py = read_value_with_structs(&mut reader, &return_type, &struct_map, py)
+                .unwrap_or_else(|_| py.None());
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                 "Service exception (field {}): {:?}",
                 field_begin.id,
@@ -308,9 +305,8 @@ impl ThriftClient {
             )));
         }
 
-        let rust_val = read_rust_value(&mut reader, &return_type, &struct_map)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-        thrift_value_to_py(&rust_val, py)
+        // Decode the return value directly into a Python object (no ThriftValue allocation).
+        read_value_with_structs(&mut reader, &return_type, &struct_map, py)
     }
 }
 

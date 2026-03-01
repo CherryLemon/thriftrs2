@@ -53,22 +53,20 @@ pub struct ThriftStruct {
     /// Shared map of all structs in the parsed document — used by new_instance
     /// to give the created ThriftStructInstance schema-aware setattr coercion.
     pub(crate) struct_map: Arc<HashMap<String, ThriftStruct>>,
+    /// Pre-built schema map (field name -> ThriftField), shared cheaply via Arc.
+    pub(crate) schema_arc: Arc<HashMap<String, ThriftField>>,
+    /// Pre-built ordered field name list, shared cheaply via Arc.
+    pub(crate) field_names_arc: Arc<Vec<String>>,
 }
 
 #[pymethods]
 impl ThriftStruct {
     /// Construct an empty ThriftStructInstance with all fields set to None.
     pub fn new_instance(&self, _py: Python<'_>) -> ThriftStructInstance {
-        let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
         ThriftStructInstance::empty(
             self.name.clone(),
-            field_names,
-            schema,
+            Arc::clone(&self.field_names_arc),
+            Arc::clone(&self.schema_arc),
             Arc::clone(&self.struct_map),
         )
     }
@@ -78,23 +76,17 @@ impl ThriftStruct {
         py: Python<'_>,
         items: &Bound<'_, PyDict>,
     ) -> ThriftStructInstance {
-        let field_names: Vec<String> = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
         let mut instance = ThriftStructInstance::empty(
             self.name.clone(),
-            field_names,
-            schema.clone(),
+            Arc::clone(&self.field_names_arc),
+            Arc::clone(&self.schema_arc),
             Arc::clone(&self.struct_map),
         );
         for (k, v) in items.iter() {
             if let Ok(name) = k.extract::<String>() {
-                if instance.field_names.contains(&name) {
+                if instance.is_valid_field(&name) {
                     instance.cache.insert(name.clone(), v.clone().unbind());
-                    let tv_result = if let Some(field) = schema.get(&name) {
+                    let tv_result = if let Some(field) = self.schema_arc.get(&name) {
                         py_any_to_thrift_value_with_type(
                             &v,
                             &field.field_type.clone(),
@@ -104,7 +96,7 @@ impl ThriftStruct {
                         py_any_to_thrift_value(&v)
                     };
                     if let Ok(tv) = tv_result {
-                        instance.inner.values.insert(name, tv);
+                        instance.values.insert(name, tv);
                     }
                     let _ = py;
                 }
@@ -119,19 +111,13 @@ impl ThriftStruct {
         py: Python<'_>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> ThriftStructInstance {
-        let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
         if let Some(kw) = kwargs {
             self.new_instance_from_dict(py, kw)
         } else {
             ThriftStructInstance::empty(
                 self.name.clone(),
-                field_names,
-                schema,
+                Arc::clone(&self.field_names_arc),
+                Arc::clone(&self.schema_arc),
                 Arc::clone(&self.struct_map),
             )
         }
@@ -188,55 +174,23 @@ impl ThriftStruct {
     ) -> PyResult<Bound<'py, ThriftStructInstance>> {
         use std::io::Cursor;
         use crate::protocol::{
-            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader, TInputProtocol,
+            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader,
         };
         use super::serde::deserialize_struct_fields_as_instance;
         let mut cursor = Cursor::new(data);
-        let schema: HashMap<String, ThriftField> = self
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
 
         match protocol {
             crate::python::parser::ProtocolType::Binary => {
                 let mut reader = BinaryProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(
-                    &mut reader,
-                    &self.fields,
-                    &self.field_map,
-                    &self.struct_map,
-                    py,
-                    &self.name,
-                    schema,
-                    Arc::clone(&self.struct_map),
-                )
+                deserialize_struct_fields_as_instance(&mut reader, self, py)
             }
             crate::python::parser::ProtocolType::Compact => {
                 let mut reader = CompactProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(
-                    &mut reader,
-                    &self.fields,
-                    &self.field_map,
-                    &self.struct_map,
-                    py,
-                    &self.name,
-                    schema,
-                    Arc::clone(&self.struct_map),
-                )
+                deserialize_struct_fields_as_instance(&mut reader, self, py)
             }
             crate::python::parser::ProtocolType::JSON => {
                 let mut reader = JSONProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(
-                    &mut reader,
-                    &self.fields,
-                    &self.field_map,
-                    &self.struct_map,
-                    py,
-                    &self.name,
-                    schema,
-                    Arc::clone(&self.struct_map),
-                )
+                deserialize_struct_fields_as_instance(&mut reader, self, py)
             }
         }
     }
@@ -259,33 +213,7 @@ impl ThriftStruct {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// RustStructValue  –  GIL-free pure-Rust representation of a struct instance.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Pure-Rust struct value produced during deserialisation without holding the GIL.
-#[derive(Clone)]
-pub struct RustStructValue {
-    pub struct_name: String,
-    pub field_names: Vec<String>,
-    pub values: HashMap<String, ThriftValue>,
-}
-
-impl RustStructValue {
-    pub fn empty(struct_name: String, field_names: Vec<String>) -> Self {
-        Self {
-            struct_name,
-            field_names,
-            values: HashMap::new(),
-        }
-    }
-
-    pub fn set_field(&mut self, name: &str, value: ThriftValue) {
-        self.values.insert(name.to_string(), value);
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// ThriftStructInstance  –  Python-visible wrapper around RustStructValue.
+// ThriftStructInstance  –  Python-visible Thrift struct instance.
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// A live instance of a Thrift struct.
@@ -296,46 +224,57 @@ impl RustStructValue {
 pub struct ThriftStructInstance {
     #[pyo3(get)]
     pub struct_name: String,
-    pub field_names: Vec<String>,
-    /// Pure-Rust inner store.  Populated at deserialisation time without GIL.
-    pub inner: RustStructValue,
+    pub field_names: Arc<Vec<String>>,
+    /// Thrift-value store, populated at deserialisation time or via __setattr__.
+    pub values: HashMap<String, ThriftValue>,
     /// Lazy Python-object cache.
     pub cache: HashMap<String, Py<PyAny>>,
     /// Schema: field name → ThriftField, used by __setattr__ for type-aware coercion.
-    pub schema: HashMap<String, ThriftField>,
+    pub schema: Arc<HashMap<String, ThriftField>>,
     /// Shared struct map for resolving nested struct types in schema-aware coercion.
     pub struct_map: Arc<HashMap<String, ThriftStruct>>,
 }
+
 
 impl Clone for ThriftStructInstance {
     fn clone(&self) -> Self {
         Python::attach(|py| Self {
             struct_name: self.struct_name.clone(),
-            field_names: self.field_names.clone(),
-            inner: self.inner.clone(),
+            field_names: Arc::clone(&self.field_names),
+            values: self.values.clone(),
             cache: self
                 .cache
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone_ref(py)))
                 .collect(),
-            schema: self.schema.clone(),
+            schema: Arc::clone(&self.schema),
             struct_map: Arc::clone(&self.struct_map),
         })
     }
 }
 
 impl ThriftStructInstance {
+    /// Returns `true` if `name` is a declared field of this struct.
+    #[inline]
+    fn is_valid_field(&self, name: &str) -> bool {
+        if !self.schema.is_empty() {
+            self.schema.contains_key(name)
+        } else {
+            self.field_names.iter().any(|n| n == name)
+        }
+    }
+
     pub fn from_rust(
-        inner: RustStructValue,
-        schema: HashMap<String, ThriftField>,
+        struct_name: String,
+        field_names: Arc<Vec<String>>,
+        values: HashMap<String, ThriftValue>,
+        schema: Arc<HashMap<String, ThriftField>>,
         struct_map: Arc<HashMap<String, ThriftStruct>>,
     ) -> Self {
-        let struct_name = inner.struct_name.clone();
-        let field_names = inner.field_names.clone();
         Self {
             struct_name,
             field_names,
-            inner,
+            values,
             cache: HashMap::new(),
             schema,
             struct_map,
@@ -344,15 +283,14 @@ impl ThriftStructInstance {
 
     pub fn empty(
         struct_name: String,
-        field_names: Vec<String>,
-        schema: HashMap<String, ThriftField>,
+        field_names: Arc<Vec<String>>,
+        schema: Arc<HashMap<String, ThriftField>>,
         struct_map: Arc<HashMap<String, ThriftStruct>>,
     ) -> Self {
-        let inner = RustStructValue::empty(struct_name.clone(), field_names.clone());
         Self {
             struct_name,
             field_names,
-            inner,
+            values: HashMap::new(),
             cache: HashMap::new(),
             schema,
             struct_map,
@@ -360,18 +298,18 @@ impl ThriftStructInstance {
     }
 
     pub fn set_field(&mut self, name: &str, value: ThriftValue) {
-        self.inner.set_field(name, value);
+        self.values.insert(name.to_string(), value);
     }
 
     pub fn get_field<'py>(&mut self, py: Python<'py>, name: &str) -> Option<Bound<'py, PyAny>> {
-        if !self.field_names.contains(&name.to_string()) {
+        if !self.is_valid_field(name) {
             return None;
         }
         if let Some(v) = self.cache.get(name) {
             return Some(v.bind(py).clone());
         }
-        let py_val = match self.inner.values.get(name) {
-            Some(tv) => thrift_value_to_py(tv, py).unwrap_or_else(|_| py.None()),
+        let py_val = match self.values.get(name) {
+            Some(tv) => thrift_value_to_py(tv, py, &self.struct_map).unwrap_or_else(|_| py.None()),
             None => py.None(),
         };
         self.cache.insert(name.to_string(), py_val);
@@ -395,23 +333,18 @@ impl ThriftStructInstance {
             }
         }
         let _ = py;
-        let inner = RustStructValue {
-            struct_name: struct_name.clone(),
-            field_names: field_names.clone(),
-            values: HashMap::new(),
-        };
         Self {
             struct_name,
-            field_names,
-            inner,
+            field_names: Arc::new(field_names),
+            values: HashMap::new(),
             cache,
-            schema: HashMap::new(),
+            schema: Arc::new(HashMap::new()),
             struct_map: Arc::new(HashMap::new()),
         }
     }
 
     pub fn __getattr__(&mut self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
-        if self.field_names.contains(&name.to_string()) {
+        if self.is_valid_field(name) {
             Ok(self
                 .get_field(py, name)
                 .map(|v| v.unbind())
@@ -425,7 +358,7 @@ impl ThriftStructInstance {
     }
 
     pub fn __setattr__(&mut self, py: Python<'_>, name: &str, value: Py<PyAny>) -> PyResult<()> {
-        if self.field_names.contains(&name.to_string()) {
+        if self.is_valid_field(name) {
             self.cache.insert(name.to_string(), value.clone_ref(py));
             let bound = value.bind(py);
             let tv_result = if let Some(field) = self.schema.get(name) {
@@ -434,9 +367,9 @@ impl ThriftStructInstance {
                 py_any_to_thrift_value(bound)
             };
             if let Ok(tv) = tv_result {
-                self.inner.values.insert(name.to_string(), tv);
+                self.values.insert(name.to_string(), tv);
             } else {
-                self.inner.values.remove(name);
+                self.values.remove(name);
             }
             Ok(())
         } else {
@@ -465,7 +398,7 @@ impl ThriftStructInstance {
     pub fn to_dict<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         let names = self.field_names.clone();
-        for name in &names {
+        for name in names.as_ref() {
             let v = self
                 .get_field(py, name)
                 .unwrap_or_else(|| py.None().into_bound(py));
@@ -475,7 +408,7 @@ impl ThriftStructInstance {
     }
 
     pub fn field_names(&self) -> Vec<String> {
-        self.field_names.clone()
+        self.field_names.as_ref().clone()
     }
 }
 

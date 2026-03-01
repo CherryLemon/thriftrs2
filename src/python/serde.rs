@@ -11,8 +11,26 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::types::{
-    RustStructValue, ThriftField, ThriftStruct, ThriftStructInstance,
+    ThriftField, ThriftStruct, ThriftStructInstance,
 };
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RustStructValue  –  GIL-free pure-Rust representation used during deserialization.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Pure-Rust struct value produced during deserialisation without holding the GIL.
+#[derive(Clone)]
+pub(crate) struct RustStructValue {
+    pub struct_name: String,
+    pub field_names: Vec<String>,
+    pub values: HashMap<String, ThriftValue>,
+}
+
+impl RustStructValue {
+    pub fn set_field(&mut self, name: &str, value: ThriftValue) {
+        self.values.insert(name.to_string(), value);
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Type helpers
@@ -86,7 +104,7 @@ pub(crate) fn serialize_struct_any<P: TOutputProtocol>(
                         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
                     })?;
                 }
-            } else if let Some(tv) = instance.inner.values.get(&field.name) {
+            } else if let Some(tv) = instance.values.get(&field.name) {
                 let field_begin = FieldBegin {
                     name: None,
                     field_type: thrift_type_to_ttype(&field.field_type),
@@ -387,18 +405,20 @@ pub(crate) fn deserialize_struct_fields<'py, P: TInputProtocol>(
 /// Deserialize struct fields into a `ThriftStructInstance`.
 pub(crate) fn deserialize_struct_fields_as_instance<'py, P: TInputProtocol>(
     reader: &mut P,
-    fields: &[ThriftField],
-    field_map: &HashMap<i16, usize>,
-    struct_map: &HashMap<String, ThriftStruct>,
+    struct_def: &ThriftStruct,
     py: Python<'py>,
-    struct_name: &str,
-    schema: HashMap<String, ThriftField>,
-    struct_map_arc: Arc<HashMap<String, ThriftStruct>>,
 ) -> PyResult<Bound<'py, ThriftStructInstance>> {
-    let mut rust_val = deserialize_rust_struct(reader, fields, field_map, struct_map)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
-    rust_val.struct_name = struct_name.to_string();
-    let instance = ThriftStructInstance::from_rust(rust_val, schema, struct_map_arc);
+    let mut rust_val =
+        deserialize_rust_struct(reader, &struct_def.fields, &struct_def.field_map, &struct_def.struct_map)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
+    rust_val.struct_name = struct_def.name.clone();
+    let instance = ThriftStructInstance::from_rust(
+        rust_val.struct_name,
+        Arc::new(rust_val.field_names),
+        rust_val.values,
+        Arc::clone(&struct_def.schema_arc),
+        Arc::clone(&struct_def.struct_map),
+    );
     Ok(Bound::new(py, instance)?)
 }
 
@@ -460,14 +480,8 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
                     format!("Unknown struct type: {}", struct_name),
                 )
             })?;
-            let fm: HashMap<i16, usize> = struct_def
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (f.id, i))
-                .collect();
             reader.read_struct_begin().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            let nested = deserialize_rust_struct(reader, &struct_def.fields, &fm, struct_map)?;
+            let nested = deserialize_rust_struct(reader, &struct_def.fields, &struct_def.field_map, struct_map)?;
             reader.read_struct_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(ThriftValue::Struct {
                 name: Some(struct_name.clone()),
@@ -511,7 +525,6 @@ pub(crate) fn deserialize_rust_struct<P: TInputProtocol>(
     Ok(result)
 }
 
-#[allow(dead_code)]
 pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
     reader: &mut P,
     thrift_type: &ThriftType,
@@ -612,32 +625,48 @@ pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
                     struct_name
                 ))
             })?;
-            let fm: HashMap<i16, usize> = struct_def
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (f.id, i))
-                .collect();
-            let schema: HashMap<String, ThriftField> = struct_def
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.clone()))
-                .collect();
             reader.read_struct_begin().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             let instance = deserialize_struct_fields_as_instance(
                 reader,
-                &struct_def.fields,
-                &fm,
-                struct_map,
+                struct_def,
                 py,
-                struct_name,
-                schema,
-                struct_def.struct_map.clone(),
             )?;
             reader.read_struct_end().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(instance.into_any().unbind())
         }
     }
+}
+
+#[allow(dead_code)]
+/// Decode a struct from the wire directly into a `PyDict` (field_name → Python value).
+/// This is allocation-free on the Rust side (no ThriftStructInstance, no HashSet, no schema map).
+pub(crate) fn read_struct_as_dict<'py, P: TInputProtocol>(
+    reader: &mut P,
+    struct_def: &ThriftStruct,
+    struct_map: &HashMap<String, ThriftStruct>,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    loop {
+        let field_begin = reader
+            .read_field_begin()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        if field_begin.field_type == TType::Stop {
+            break;
+        }
+        if let Some(&idx) = struct_def.field_map.get(&field_begin.id) {
+            let field = &struct_def.fields[idx];
+            let val = read_value_with_structs(reader, &field.field_type, struct_map, py)?;
+            dict.set_item(&field.name, val.bind(py))?;
+        } else {
+            skip_value(reader, field_begin.field_type)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        }
+        reader
+            .read_field_end()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    }
+    Ok(dict)
 }
 
 /// Skip over a value of the given wire type without allocating Python objects.
@@ -700,7 +729,14 @@ pub(crate) fn skip_value<P: TInputProtocol>(
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Convert a `ThriftValue` to a Python object.
-pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<Py<PyAny>> {
+///
+/// `struct_map` is used to give nested `ThriftStructInstance` objects their
+/// schema so that *their* fields are also lazily converted on first access.
+pub(crate) fn thrift_value_to_py(
+    val: &ThriftValue,
+    py: Python<'_>,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+) -> PyResult<Py<PyAny>> {
     match val {
         ThriftValue::Bool(v) => Ok(v.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
         ThriftValue::Byte(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
@@ -713,7 +749,7 @@ pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<
         ThriftValue::List(items) | ThriftValue::Set(items) => {
             let list = PyList::empty(py);
             for item in items {
-                list.append(thrift_value_to_py(item, py)?.bind(py))?;
+                list.append(thrift_value_to_py(item, py, struct_map)?.bind(py))?;
             }
             Ok(list.into_any().unbind())
         }
@@ -721,22 +757,34 @@ pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<
             let d = PyDict::new(py);
             for (k, v) in pairs {
                 d.set_item(
-                    thrift_value_to_py(k, py)?.bind(py),
-                    thrift_value_to_py(v, py)?.bind(py),
+                    thrift_value_to_py(k, py, struct_map)?.bind(py),
+                    thrift_value_to_py(v, py, struct_map)?.bind(py),
                 )?;
             }
             Ok(d.into_any().unbind())
         }
         ThriftValue::Struct { name, fields } => {
-            let field_names: Vec<String> = fields.keys().cloned().collect();
             let struct_name = name.clone().unwrap_or_default();
-            let inner = RustStructValue {
-                struct_name: struct_name.clone(),
-                field_names: field_names.clone(),
-                values: fields.clone(),
-            };
-            let instance =
-                ThriftStructInstance::from_rust(inner, HashMap::new(), Arc::new(HashMap::new()));
+            // Resolve the schema for this nested struct from the shared struct_map.
+            let schema: Arc<HashMap<String, ThriftField>> = struct_map
+                .get(&struct_name)
+                .map(|def| Arc::clone(&def.schema_arc))
+                .unwrap_or_default();
+            // Preserve field order from schema definition when available, fall back
+            // to HashMap iteration order otherwise.
+            let field_names: Arc<Vec<String>> = struct_map
+                .get(&struct_name)
+                .map(|def| Arc::clone(&def.field_names_arc))
+                .unwrap_or_else(|| Arc::new(fields.keys().cloned().collect()));
+            // Build a fully schema-aware instance so its own get_field calls are
+            // also lazy and schema-correct.
+            let instance = ThriftStructInstance::from_rust(
+                struct_name,
+                field_names,
+                fields.clone(),
+                schema,
+                Arc::clone(struct_map),
+            );
             Ok(Bound::new(py, instance)?.into_any().unbind())
         }
     }
@@ -779,10 +827,10 @@ pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftV
     }
     if let Ok(inst) = val.cast::<ThriftStructInstance>() {
         let inst = inst.borrow();
-        let mut fields = inst.inner.values.clone();
+        let mut fields = inst.values.clone();
         let has_schema = !inst.schema.is_empty();
-        for name in &inst.field_names {
-            if let Some(py_val) = inst.cache.get(name) {
+        for name in inst.field_names.as_ref() {
+            if let Some(py_val) = inst.cache.get(name.as_str()) {
                 let bound = py_val.bind(val.py());
                 let tv_result = if has_schema {
                     if let Some(field) = inst.schema.get(name) {
@@ -869,8 +917,8 @@ pub(crate) fn py_any_to_thrift_value_with_type(
             if let Ok(inst) = val.cast::<ThriftStructInstance>() {
                 let inst = inst.borrow();
                 let schema: Option<&ThriftStruct> = struct_map.get(struct_name.as_str());
-                let mut fields = inst.inner.values.clone();
-                for name in &inst.field_names {
+                let mut fields = inst.values.clone();
+                for name in inst.field_names.as_ref() {
                     if let Some(py_val) = inst.cache.get(name) {
                         let bound = py_val.bind(val.py());
                         let tv_result = if let Some(def) = schema {

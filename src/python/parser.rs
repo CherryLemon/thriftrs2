@@ -62,11 +62,19 @@ impl ThriftParser {
                     .enumerate()
                     .map(|(idx, f)| (f.id, idx))
                     .collect();
+                let schema_arc: Arc<HashMap<String, ThriftField>> = Arc::new(
+                    fields.iter().map(|f| (f.name.clone(), f.clone())).collect(),
+                );
+                let field_names_arc: Arc<Vec<String>> = Arc::new(
+                    fields.iter().map(|f| f.name.clone()).collect(),
+                );
                 ThriftStruct {
                     name: s.name.clone(),
                     fields,
                     field_map,
                     struct_map: Arc::new(HashMap::new()),
+                    schema_arc,
+                    field_names_arc,
                 }
             })),
             None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -160,6 +168,12 @@ impl ThriftParser {
                         .enumerate()
                         .map(|(idx, f)| (f.id, idx))
                         .collect();
+                    let schema_arc: Arc<HashMap<String, ThriftField>> = Arc::new(
+                        fields.iter().map(|f| (f.name.clone(), f.clone())).collect(),
+                    );
+                    let field_names_arc: Arc<Vec<String>> = Arc::new(
+                        fields.iter().map(|f| f.name.clone()).collect(),
+                    );
                     (
                         k.clone(),
                         ThriftStruct {
@@ -167,6 +181,8 @@ impl ThriftParser {
                             fields,
                             field_map,
                             struct_map: Arc::new(HashMap::new()),
+                            schema_arc,
+                            field_names_arc,
                         },
                     )
                 })
@@ -184,6 +200,8 @@ impl ThriftParser {
                         fields: s.fields.clone(),
                         field_map: s.field_map.clone(),
                         struct_map: Arc::clone(&arc),
+                        schema_arc: Arc::clone(&s.schema_arc),
+                        field_names_arc: Arc::clone(&s.field_names_arc),
                     },
                 )
             })

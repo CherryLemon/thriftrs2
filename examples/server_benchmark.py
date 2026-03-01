@@ -36,6 +36,7 @@ import string
 import argparse
 import threading
 import statistics
+import multiprocessing
 from collections import defaultdict
 
 # from tqdm import trange
@@ -50,11 +51,17 @@ THRIFT_FILE = os.path.join(EXAMPLES_DIR, 'example.thrift')
 try:
     import thriftpy2
     from thriftpy2.rpc import make_client as tp2_make_client, make_server as tp2_make_server
-    from thriftpy2.transport import TCyBufferedTransportFactory
+    from thriftpy2.transport import TCyBufferedTransportFactory, TBufferedTransportFactory
     HAS_THRIFTPY2 = True
 except ImportError:
     HAS_THRIFTPY2 = False
     print("[WARN] thriftpy2 not found")
+    # defined as None so static analysis won't flag undefined names
+    thriftpy2 = None
+    tp2_make_client = None
+    tp2_make_server = None
+    TCyBufferedTransportFactory = None
+    TBufferedTransportFactory = None
 
 try:
     from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport, make_client as rs_make_client, make_server as rs_make_server
@@ -62,6 +69,12 @@ try:
 except ImportError:
     HAS_RS = False
     print("[WARN] thrift_rs_pyo3 not found")
+    # placeholder names for static analysis
+    rs_load = None
+    ThriftServer = None
+    TBufferedTransport = None
+    rs_make_client = None
+    rs_make_server = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -85,11 +98,11 @@ def init(thrift_mod):
     _db: dict = {}
     _next_id = [1001]
 
-    for i in range(1, 1001):
+    for i in range(1, 201):
         _db[i] = thrift_mod.User(
             id=i,
             name=f"{_rand_str()}",
-            email=f"{_rand_str(8)}@example.com",
+            email=f"{_rand_str(32)}@example.com",
             age=random.randint(18, 80),
         )
 
@@ -124,6 +137,7 @@ def start_rs_server(host: str, port: int) -> None:
         init(thrift_mod),
         host=host,
         port=port,
+        workers=4
     )
 
     _wait_port(host, port)
@@ -191,23 +205,22 @@ def _bench_worker(
     port: int,
     ops_mix: list,
     n_requests: int,
-    results: list,        # append list-of-(op, latency_s)
-    errors: list,         # append error strings
-    barrier: threading.Barrier,
+    result_queue: multiprocessing.Queue,  # will receive (latencies_list, errors_list)
     use_rs: bool = False,
 ) -> None:
+    """Process worker: performs requests and puts (latencies, errors) into result_queue."""
     try:
         if use_rs:
             client, thrift_mod = make_rs_client(host, port)
         else:
             client, thrift_mod = make_tp2_client(host, port)
     except Exception as exc:
-        errors.append(f"connect error: {exc}")
-        barrier.wait()
+        # send empty latencies with connect error
+        result_queue.put(([], [f"connect error: {exc}"]))
         return
 
     local_latencies = []
-    local_errors    = []
+    local_errors = []
 
     try:
         for _ in trange(n_requests):
@@ -219,7 +232,7 @@ def _bench_worker(
                         uid = random.randint(1, 5)
                         client.call("get_user", user_id=uid)
                     elif op == 'list':
-                        client.call("list_users")
+                        ids = [i.id for i in client.call("list_users")]
                     elif op == 'create':
                         uid = random.randint(1000, 99999)
                         user = thrift_mod.User(**{
@@ -234,7 +247,7 @@ def _bench_worker(
                         uid = random.randint(1, 5)
                         client.get_user(uid)
                     elif op == 'list':
-                        client.list_users()
+                        ids = [i.id for i in client.list_users()]
                     elif op == 'create':
                         uid = random.randint(1000, 99999)
                         user = thrift_mod.User(
@@ -247,15 +260,16 @@ def _bench_worker(
                 elapsed = time.perf_counter() - t0
                 local_latencies.append((op, elapsed))
             except Exception as exc:
-                print(exc)
                 local_errors.append(f"{op}: {exc}")
     finally:
         if use_rs:
-            client.close()
+            try:
+                client.close()
+            except Exception:
+                pass
 
-    results.append(local_latencies)
-    errors.extend(local_errors)
-    barrier.wait()
+    # send results back to parent
+    result_queue.put((local_latencies, local_errors))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -280,29 +294,40 @@ def _run_bench(
     use_rs: bool = False,
 ) -> tuple:
     """
-    Spawn `concurrency` threads, each making `requests_per_thread` calls.
+    Spawn `concurrency` processes, each making `requests_per_thread` calls.
     Returns (all_latencies, all_errors, wall_seconds).
     """
-    all_latencies: list = []
-    all_errors:    list = []
-    # +1 so main thread participates in barrier → measures pure worker wall-time
-    barrier = threading.Barrier(concurrency + 1)
+    manager = multiprocessing.Manager()
+    result_queue = manager.Queue()
 
-    threads = [
-        threading.Thread(
+    processes = [
+        multiprocessing.Process(
             target=_bench_worker,
-            args=(host, port, ops_mix, requests_per_thread,
-                  all_latencies, all_errors, barrier),
+            args=(host, port, ops_mix, requests_per_thread, result_queue),
             kwargs={"use_rs": use_rs},
-            daemon=True,
+            daemon=False,
         )
         for _ in range(concurrency)
     ]
 
+    # start processes
     t_start = time.perf_counter()
-    for t in threads:
-        t.start()
-    barrier.wait()   # released when every worker has finished
+    for p in processes:
+        p.start()
+
+    # collect results
+    all_latencies = []
+    all_errors = []
+
+    for _ in range(concurrency):
+        lat_list, err_list = result_queue.get()
+        all_latencies.append(lat_list)
+        all_errors.extend(err_list)
+
+    # ensure all processes exit
+    for p in processes:
+        p.join()
+
     wall = time.perf_counter() - t_start
 
     return all_latencies, all_errors, wall
@@ -424,9 +449,9 @@ def main() -> None:
         description='Concurrent Thrift RPC server benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-n', '--requests',    type=int, default=2000,
+    ap.add_argument('-n', '--requests',    type=int, default=15000,
                     help='Total requests per server (default: 2000)')
-    ap.add_argument('-c', '--concurrency', type=int, default=10,
+    ap.add_argument('-c', '--concurrency', type=int, default=30,
                     help='Concurrent client threads (default: 20)')
     ap.add_argument('--warmup',            type=int, default=200,
                     help='Warmup requests per server (default: 200)')
@@ -452,7 +477,7 @@ def main() -> None:
     print('═' * 62)
     print('  Thrift RPC Concurrent Server Benchmark')
     print('═' * 62)
-    print(f'  Concurrency      : {args.concurrency} threads')
+    print(f'  Concurrency      : {args.concurrency} processes')
     print(f'  Requests/server  : {rpt * args.concurrency}  ({rpt} × {args.concurrency})')
     print(f'  Warmup/server    : {wpt * args.concurrency}')
     print(f'  Op mix           : {args.mix}')
@@ -490,7 +515,7 @@ def main() -> None:
     print('\nWarming up...')
     if rs_ok:
         try:
-            _run_bench(host, rs_port, ops_mix, wpt, wc, use_rs=False)
+            _run_bench(host, rs_port, ops_mix, wpt, wc, use_rs=True)
             print('  [rs   ] warmup done')
         except Exception as exc:
             print(f'  [rs   ] warmup error: {exc}')
@@ -514,7 +539,7 @@ def main() -> None:
 
     if tp2_ok:
         print(f'\n  → thriftpy2       ({host}:{tp2_port}) …')
-        lats, errs, wall = _run_bench(host, rs_port, ops_mix, rpt, args.concurrency, use_rs=False)
+        lats, errs, wall = _run_bench(host, tp2_port, ops_mix, rpt, args.concurrency, use_rs=False)
         tp2_stats = _report('thriftpy2', lats, errs, wall)
 
     if rs_ok and tp2_ok:
