@@ -15,7 +15,8 @@ nom = "8.0.0"
 serde_json = "1.0"
 byteorder = "1.5"
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 num_cpus = "1.16"
 
 [profile.release]

@@ -1,5 +1,5 @@
 from typing import Any, Dict, IO
-from .thrift_rs_pyo3 import BinaryProtocol, ThriftStruct, TransportType
+from .thrift_rs_pyo3 import BinaryProtocol, CompactProtocol, ThriftStruct, TransportType, ProtocolType
 
 
 class TBinaryProtocol:
@@ -14,7 +14,7 @@ class TBinaryProtocol:
 
     def read_struct(self, struct_def: ThriftStruct, data: bytes) -> Dict[str, Any]:
         """Deserialize a struct from binary format"""
-        return BinaryProtocol.deserialize_struct(struct_def, data)
+        return BinaryProtocol.deserialize_struct(struct_def, data).to_dict()
 
 
 class TBinaryProtocolFactory:
@@ -22,6 +22,28 @@ class TBinaryProtocolFactory:
 
     def get_protocol(self, trans):
         return TBinaryProtocol(trans)
+
+
+class TCompactProtocol:
+    """Compact protocol implementation compatible with thriftpy2"""
+
+    def __init__(self, trans=None):
+        self.trans = trans
+
+    def write_struct(self, struct_def: ThriftStruct, data: Dict[str, Any]) -> bytes:
+        """Serialize a struct to compact format"""
+        return CompactProtocol.serialize_struct(struct_def, data)
+
+    def read_struct(self, struct_def: ThriftStruct, data: bytes) -> Dict[str, Any]:
+        """Deserialize a struct from compact format"""
+        return CompactProtocol.deserialize_struct(struct_def, data).to_dict()
+
+
+class TCompactProtocolFactory:
+    """Factory for creating compact protocol instances"""
+
+    def get_protocol(self, trans):
+        return TCompactProtocol(trans)
 
 
 # ---------------------------------------------------------------------------
@@ -48,12 +70,21 @@ class TBufferedTransport:
 
 
 # Convenience functions similar to thriftpy2 — call the Rust static methods directly
-# to avoid constructing any Python wrapper objects per call.
-def serialize(struct_def: ThriftStruct, data: Dict[str, Any]) -> bytes:
-    """Serialize struct data to binary format"""
-    return BinaryProtocol.serialize_struct(struct_def, data)
 
 
-def deserialize(struct_def: ThriftStruct, data: bytes) -> Dict[str, Any]:
-    """Deserialize binary data to struct"""
-    return BinaryProtocol.deserialize_struct(struct_def, data)
+def serialize(struct_def: ThriftStruct, data: Dict[str, Any], proto: ProtocolType = ProtocolType.Binary) -> bytes:
+    """Serialize struct data to target protocol format"""
+    return struct_def.serialize_with_protocol(data, proto)
+
+
+def deserialize(struct_def: ThriftStruct, data: bytes, proto: ProtocolType = ProtocolType.Binary) -> Dict[str, Any]:
+    """Deserialize target protocol data to struct"""
+    return struct_def.deserialize_with_protocol(data, proto).to_dict()
+
+def dumps(struct_def: ThriftStruct, data: Dict[str, Any]) -> str:
+    """Serialize struct data to JSON format"""
+    return struct_def.serialize_with_protocol(data, ProtocolType.JSON)
+
+def loads(struct_def: ThriftStruct, data: bytes, proto: ProtocolType = ProtocolType.Binary) -> Dict[str, Any]:
+    """Deserialize target protocol data to struct"""
+    return struct_def.deserialize_with_protocol(data, ProtocolType.JSON).to_dict()

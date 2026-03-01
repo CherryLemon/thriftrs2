@@ -2,6 +2,9 @@
 // parser.rs  –  ThriftParser and BinaryProtocol Python bindings
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::parser::{ast::*, Parser};
+use crate::python::serde::{
+    deserialize_struct_fields_as_instance, serialize_struct_any,
+};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -190,8 +193,16 @@ impl ThriftParser {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// BinaryProtocol
+// Protocols
 // ──────────────────────────────────────────────────────────────────────────────
+
+#[pyclass(from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolType {
+    Binary,
+    Compact,
+    JSON,
+}
 
 #[pyclass]
 pub struct BinaryProtocol;
@@ -209,7 +220,7 @@ impl BinaryProtocol {
         struct_def: &ThriftStruct,
         data: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<u8>> {
-        struct_def.serialize(py, data)
+        struct_def.serialize_with_protocol(py, data, ProtocolType::Binary)
     }
 
     #[staticmethod]
@@ -218,8 +229,65 @@ impl BinaryProtocol {
         struct_def: &ThriftStruct,
         data: &[u8],
     ) -> PyResult<Bound<'py, PyAny>> {
-        struct_def.deserialize(py, data).map(|d| d.into_any())
+        struct_def.deserialize_with_protocol(py, data, ProtocolType::Binary).map(|d| d.into_any())
     }
 }
 
+#[pyclass]
+pub struct CompactProtocol;
+
+#[pymethods]
+impl CompactProtocol {
+    #[new]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[staticmethod]
+    pub fn serialize_struct(
+        py: Python<'_>,
+        struct_def: &ThriftStruct,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<u8>> {
+        struct_def.serialize_with_protocol(py, data, ProtocolType::Compact)
+    }
+
+    #[staticmethod]
+    pub fn deserialize_struct<'py>(
+        py: Python<'py>,
+        struct_def: &ThriftStruct,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        struct_def.deserialize_with_protocol(py, data, ProtocolType::Compact).map(|d| d.into_any())
+    }
+}
+
+#[pyclass]
+pub struct JSONProtocol;
+
+#[pymethods]
+impl JSONProtocol {
+    #[new]
+    pub fn new() -> Self {
+        Self
+    }
+
+    #[staticmethod]
+    pub fn serialize_struct(
+        py: Python<'_>,
+        struct_def: &ThriftStruct,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<u8>> {
+        struct_def.serialize_with_protocol(py, data, ProtocolType::JSON)
+    }
+
+    #[staticmethod]
+    pub fn deserialize_struct<'py>(
+        py: Python<'py>,
+        struct_def: &ThriftStruct,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        struct_def.deserialize_with_protocol(py, data, ProtocolType::JSON).map(|d| d.into_any())
+    }
+}
 

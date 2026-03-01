@@ -28,6 +28,7 @@ pub enum Token {
     GreaterThan,
     Colon,
     Equal,
+    Dot,
 }
 
 pub fn parse_identifier(input: &str) -> IResult<&str, String> {
@@ -96,6 +97,7 @@ pub fn parse_token(input: &str) -> IResult<&str, Token> {
             map(char('>'), |_| Token::GreaterThan),
             map(char(':'), |_| Token::Colon),
             map(char('='), |_| Token::Equal),
+            map(char('.'), |_| Token::Dot),
         )),
     ).parse(input)
 }

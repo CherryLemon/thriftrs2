@@ -85,7 +85,7 @@ def init(thrift_mod):
     _db: dict = {}
     _next_id = [1001]
 
-    for i in range(1, 101):
+    for i in range(1, 1001):
         _db[i] = thrift_mod.User(
             id=i,
             name=f"{_rand_str()}",
@@ -424,9 +424,9 @@ def main() -> None:
         description='Concurrent Thrift RPC server benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-n', '--requests',    type=int, default=1000,
+    ap.add_argument('-n', '--requests',    type=int, default=2000,
                     help='Total requests per server (default: 2000)')
-    ap.add_argument('-c', '--concurrency', type=int, default=5,
+    ap.add_argument('-c', '--concurrency', type=int, default=10,
                     help='Concurrent client threads (default: 20)')
     ap.add_argument('--warmup',            type=int, default=200,
                     help='Warmup requests per server (default: 200)')
@@ -514,7 +514,7 @@ def main() -> None:
 
     if tp2_ok:
         print(f'\n  → thriftpy2       ({host}:{tp2_port}) …')
-        lats, errs, wall = _run_bench(host, tp2_port, ops_mix, rpt, args.concurrency, use_rs=False)
+        lats, errs, wall = _run_bench(host, rs_port, ops_mix, rpt, args.concurrency, use_rs=False)
         tp2_stats = _report('thriftpy2', lats, errs, wall)
 
     if rs_ok and tp2_ok:

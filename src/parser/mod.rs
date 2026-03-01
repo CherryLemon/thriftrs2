@@ -141,7 +141,13 @@ impl Parser {
         // Skip optional default value and semicolon
         if let Ok(Token::Equal) = self.current_token() {
             self.consume_token()?; // consume '='
-            self.consume_token()?; // consume default value (simplified)
+            // Consume the default value token (number, string, or identifier)
+            self.consume_token()?;
+            // If followed by a Dot, consume the qualified part (e.g. EnumType.VALUE)
+            if let Ok(Token::Dot) = self.current_token() {
+                self.consume_token()?; // consume '.'
+                self.consume_token()?; // consume the value after dot
+            }
         }
 
         if let Ok(Token::Semicolon) = self.current_token() {

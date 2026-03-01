@@ -4,7 +4,7 @@ mod python;
 
 use pyo3::prelude::*;
 use python::client::{ThriftApplicationException, ThriftClient};
-use python::parser::{BinaryProtocol, ThriftParser};
+use python::parser::{BinaryProtocol, CompactProtocol, JSONProtocol, ProtocolType, ThriftParser};
 use python::server::ThriftServer;
 use python::types::{
     PyThriftMethod, PyThriftService, ThriftField, ThriftStruct, ThriftStructInstance, TransportType,
@@ -21,6 +21,9 @@ fn thrift_rs_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyThriftService>()?;
     m.add_class::<PyThriftMethod>()?;
     m.add_class::<ThriftServer>()?;
+    m.add_class::<ProtocolType>()?;
+    m.add_class::<CompactProtocol>()?;
+    m.add_class::<JSONProtocol>()?;
     m.add_class::<TransportType>()?;
     m.add_class::<ThriftClient>()?;
     m.add_class::<ThriftApplicationException>()?;

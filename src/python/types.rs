@@ -137,17 +137,108 @@ impl ThriftStruct {
         }
     }
 
-    /// Serialize a struct from either a `ThriftStructInstance` or a plain `dict`.
-    pub fn serialize(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
-        use crate::protocol::BinaryProtocolWriter;
+    /// Serialize a struct from either a `ThriftStructInstance` or a plain `dict` using specific protocol.
+    pub fn serialize_with_protocol(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        protocol: crate::python::parser::ProtocolType,
+    ) -> PyResult<Vec<u8>> {
+        use crate::protocol::{
+            BinaryProtocolWriter, CompactProtocolWriter, JSONProtocolWriter, TOutputProtocol,
+        };
         use super::serde::serialize_struct_any;
         let mut buffer = Vec::with_capacity(128 + self.fields.len() * 16);
-        let mut writer = BinaryProtocolWriter::new(&mut buffer);
-        serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
-        writer.write_field_stop().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
-        })?;
+        match protocol {
+            crate::python::parser::ProtocolType::Binary => {
+                let mut writer = BinaryProtocolWriter::new(&mut buffer);
+                serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
+                writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+            }
+            crate::python::parser::ProtocolType::Compact => {
+                let mut writer = CompactProtocolWriter::new(&mut buffer);
+                serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
+                writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+            }
+            crate::python::parser::ProtocolType::JSON => {
+                let mut writer = JSONProtocolWriter::new(&mut buffer);
+                serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
+                writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+            }
+        }
         Ok(buffer)
+    }
+
+    /// Serialize a struct from either a `ThriftStructInstance` or a plain `dict`.
+    pub fn serialize(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        self.serialize_with_protocol(py, data, crate::python::parser::ProtocolType::Binary)
+    }
+
+    pub fn deserialize_with_protocol<'py>(
+        &self,
+        py: Python<'py>,
+        data: &[u8],
+        protocol: crate::python::parser::ProtocolType,
+    ) -> PyResult<Bound<'py, ThriftStructInstance>> {
+        use std::io::Cursor;
+        use crate::protocol::{
+            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader, TInputProtocol,
+        };
+        use super::serde::deserialize_struct_fields_as_instance;
+        let mut cursor = Cursor::new(data);
+        let schema: HashMap<String, ThriftField> = self
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.clone()))
+            .collect();
+
+        match protocol {
+            crate::python::parser::ProtocolType::Binary => {
+                let mut reader = BinaryProtocolReader::new(&mut cursor);
+                deserialize_struct_fields_as_instance(
+                    &mut reader,
+                    &self.fields,
+                    &self.field_map,
+                    &self.struct_map,
+                    py,
+                    &self.name,
+                    schema,
+                    Arc::clone(&self.struct_map),
+                )
+            }
+            crate::python::parser::ProtocolType::Compact => {
+                let mut reader = CompactProtocolReader::new(&mut cursor);
+                deserialize_struct_fields_as_instance(
+                    &mut reader,
+                    &self.fields,
+                    &self.field_map,
+                    &self.struct_map,
+                    py,
+                    &self.name,
+                    schema,
+                    Arc::clone(&self.struct_map),
+                )
+            }
+            crate::python::parser::ProtocolType::JSON => {
+                let mut reader = JSONProtocolReader::new(&mut cursor);
+                deserialize_struct_fields_as_instance(
+                    &mut reader,
+                    &self.fields,
+                    &self.field_map,
+                    &self.struct_map,
+                    py,
+                    &self.name,
+                    schema,
+                    Arc::clone(&self.struct_map),
+                )
+            }
+        }
     }
 
     /// Deserialize bytes into a `ThriftStructInstance`.
@@ -156,26 +247,7 @@ impl ThriftStruct {
         py: Python<'py>,
         data: &[u8],
     ) -> PyResult<Bound<'py, ThriftStructInstance>> {
-        use std::io::Cursor;
-        use crate::protocol::BinaryProtocolReader;
-        use super::serde::deserialize_struct_fields_as_instance;
-        let mut cursor = Cursor::new(data);
-        let mut reader = BinaryProtocolReader::new(&mut cursor);
-        let schema: HashMap<String, ThriftField> = self
-            .fields
-            .iter()
-            .map(|f| (f.name.clone(), f.clone()))
-            .collect();
-        deserialize_struct_fields_as_instance(
-            &mut reader,
-            &self.fields,
-            &self.field_map,
-            &self.struct_map,
-            py,
-            &self.name,
-            schema,
-            Arc::clone(&self.struct_map),
-        )
+        self.deserialize_with_protocol(py, data, crate::python::parser::ProtocolType::Binary)
     }
 
     pub fn __repr__(&self) -> String {
@@ -220,7 +292,7 @@ impl RustStructValue {
 ///
 /// Fields are accessible as Python attributes (``instance.field_name``).
 /// Unknown attribute names raise ``AttributeError``.
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 pub struct ThriftStructInstance {
     #[pyo3(get)]
     pub struct_name: String,
@@ -411,7 +483,7 @@ impl ThriftStructInstance {
 // PyThriftService / PyThriftMethod  (exposed to Python)
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyThriftService {
     #[pyo3(get)]
@@ -435,7 +507,7 @@ impl PyThriftService {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyThriftMethod {
     #[pyo3(get)]
@@ -467,7 +539,7 @@ impl PyThriftMethod {
 ///
 /// * `Framed`   – each message is prefixed by a 4-byte big-endian frame length.
 /// * `Buffered` – messages are written directly to the socket with no framing.
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportType {
     Framed = 0,

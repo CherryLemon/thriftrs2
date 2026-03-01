@@ -1,22 +1,27 @@
 // ──────────────────────────────────────────────────────────────────────────────
 // client.rs  –  ThriftClient, ThriftApplicationException and I/O helpers
+//               (tokio async TCP)
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::protocol::{
-    BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, TType, MESSAGE_TYPE_CALL,
-    MESSAGE_TYPE_EXCEPTION,
+    BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, MessageBegin, TInputProtocol,
+    TOutputProtocol, TType, MESSAGE_TYPE_CALL, MESSAGE_TYPE_EXCEPTION,
 };
-use byteorder::BigEndian;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Cursor, Write};
-use std::net::TcpStream;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
 
 use super::parser::ThriftParser;
-use super::serde::{read_rust_value, skip_value, thrift_type_to_ttype, thrift_value_to_py, write_value_with_structs};
-use super::server::read_buffered_struct_body;
+use super::serde::{
+    read_rust_value, skip_value, thrift_type_to_ttype, thrift_value_to_py,
+    write_value_with_structs,
+};
 use super::types::{PyThriftService, ThriftStruct, TransportType};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -59,13 +64,13 @@ impl ThriftApplicationException {
 // ThriftClient
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Persistent, buffered I/O state for an open connection.
+/// Async I/O state for an open connection (held inside the Mutex).
 struct Connection {
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: BufReader<OwnedReadHalf>,
+    writer: BufWriter<OwnedWriteHalf>,
 }
 
-/// A synchronous Thrift Binary Protocol client.
+/// An async Thrift Binary Protocol client backed by Tokio.
 #[pyclass]
 pub struct ThriftClient {
     service: PyThriftService,
@@ -75,6 +80,10 @@ pub struct ThriftClient {
     port: u16,
     conn: Mutex<Option<Connection>>,
     seq_id: AtomicI32,
+    /// Each ThriftClient owns its own single-threaded Tokio runtime so that
+    /// `open` / `call` / `close` can be called from any Python thread without
+    /// requiring a running async context.
+    rt: Runtime,
 }
 
 #[pymethods]
@@ -86,8 +95,17 @@ impl ThriftClient {
         host: String,
         port: u16,
         transport: TransportType,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                    "tokio runtime: {}",
+                    e
+                ))
+            })?;
+        Ok(Self {
             service,
             struct_map: Arc::new(HashMap::new()),
             transport,
@@ -95,7 +113,8 @@ impl ThriftClient {
             port,
             conn: Mutex::new(None),
             seq_id: AtomicI32::new(0),
-        }
+            rt,
+        })
     }
 
     pub fn set_parser(&mut self, parser: &ThriftParser) {
@@ -104,17 +123,20 @@ impl ThriftClient {
 
     pub fn open(&self, py: Python<'_>) -> PyResult<()> {
         let addr = format!("{}:{}", self.host, self.port);
-        let stream = py.detach(|| TcpStream::connect(&addr)).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("connect to {}: {}", addr, e))
-        })?;
+        let stream: TcpStream = py
+            .detach(|| self.rt.block_on(TcpStream::connect(&addr)))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                    "connect to {}: {}",
+                    addr, e
+                ))
+            })?;
         let _ = stream.set_nodelay(true);
-        let write_stream = stream.try_clone().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("clone socket: {}", e))
-        })?;
+        let (read_half, write_half) = stream.into_split();
         let mut guard = self.conn.lock().unwrap();
         *guard = Some(Connection {
-            reader: BufReader::with_capacity(65536, stream),
-            writer: BufWriter::with_capacity(65536, write_stream),
+            reader: BufReader::with_capacity(65536, read_half),
+            writer: BufWriter::with_capacity(65536, write_half),
         });
         Ok(())
     }
@@ -174,6 +196,7 @@ impl ThriftClient {
 
         let seq_id = self.seq_id.fetch_add(1, Ordering::Relaxed);
 
+        // ── Phase 1: serialise the call frame (needs GIL for PyAny access) ────
         let call_frame: Vec<u8> = {
             let empty_dict;
             let kw: &Bound<'_, PyDict> = if let Some(k) = kwargs {
@@ -187,7 +210,11 @@ impl ThriftClient {
             {
                 let mut writer = BinaryProtocolWriter::new(&mut buf);
                 writer
-                    .write_message_begin(method_name, MESSAGE_TYPE_CALL, seq_id)
+                    .write_message_begin(&MessageBegin {
+                        name: method_name.to_string(),
+                        message_type: MESSAGE_TYPE_CALL,
+                        seq_id,
+                    })
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             }
             {
@@ -223,19 +250,19 @@ impl ThriftClient {
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
 
-        // ── Phase 2: send + recv without holding the GIL ──────────────────────
-        // The conn Mutex is held only for the network I/O, which itself is done
-        // without the GIL so other Python threads can run concurrently.
+        // ── Phase 2: async send + recv without holding the GIL ───────────────
         let reply_payload: Vec<u8> = py
             .detach(|| -> Result<Vec<u8>, String> {
                 let mut guard = self.conn.lock().unwrap();
                 let conn = guard.as_mut().ok_or_else(|| {
                     "ThriftClient is not open; call client.open() first".to_string()
                 })?;
-                conn_send_frame(&mut conn.writer, &call_frame, transport)
-                    .map_err(|e| format!("send error: {}", e))?;
-                conn_recv_frame(&mut conn.reader, transport)
-                    .map_err(|e| format!("recv error: {}", e))
+                self.rt
+                    .block_on(async {
+                        conn_send_frame(&mut conn.writer, &call_frame, transport).await?;
+                        conn_recv_frame(&mut conn.reader, transport).await
+                    })
+                    .map_err(|e| format!("I/O error: {}", e))
             })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e))?;
 
@@ -288,60 +315,61 @@ impl ThriftClient {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Client I/O helpers  (GIL-free, no Python types)
+// Async client I/O helpers  (GIL-free, no Python types)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Write a framed or buffered message through the persistent BufWriter.
-fn conn_send_frame(
-    writer: &mut BufWriter<TcpStream>,
+/// Write a framed or buffered message and flush.
+async fn conn_send_frame(
+    writer: &mut BufWriter<OwnedWriteHalf>,
     payload: &[u8],
     transport: TransportType,
 ) -> std::io::Result<()> {
-    use byteorder::WriteBytesExt;
     match transport {
         TransportType::Framed => {
-            writer.write_i32::<BigEndian>(payload.len() as i32)?;
-            writer.write_all(payload)?;
+            writer.write_i32(payload.len() as i32).await?;
+            writer.write_all(payload).await?;
         }
         TransportType::Buffered => {
-            writer.write_all(payload)?;
+            writer.write_all(payload).await?;
         }
     }
-    writer.flush()
+    writer.flush().await
 }
 
-/// Read a complete reply frame from the persistent BufReader.
-fn conn_recv_frame(
-    reader: &mut BufReader<TcpStream>,
+/// Read a complete reply frame.
+async fn conn_recv_frame(
+    reader: &mut BufReader<OwnedReadHalf>,
     transport: TransportType,
 ) -> std::io::Result<Vec<u8>> {
-    use byteorder::ReadBytesExt;
-    use std::io::Read;
-
     match transport {
         TransportType::Framed => {
-            let frame_len = match reader.read_i32::<BigEndian>() {
+            let frame_len = match reader.read_i32().await {
                 Ok(n) if n >= 0 => n as usize,
                 Ok(_) => return Ok(vec![]),
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(vec![]),
                 Err(e) => return Err(e),
             };
             let mut buf = vec![0u8; frame_len];
-            reader.read_exact(&mut buf)?;
+            reader.read_exact(&mut buf).await?;
             Ok(buf)
         }
         TransportType::Buffered => {
+            // Read the Binary protocol message header manually, then read
+            // the struct body using the sync helper (via Cursor over a buffer).
             let mut hdr = [0u8; 4];
-            reader.read_exact(&mut hdr)?;
+            reader.read_exact(&mut hdr).await?;
             let mut name_len_bytes = [0u8; 4];
-            reader.read_exact(&mut name_len_bytes)?;
+            reader.read_exact(&mut name_len_bytes).await?;
             let name_len = i32::from_be_bytes(name_len_bytes) as usize;
             let mut name_buf = vec![0u8; name_len];
-            reader.read_exact(&mut name_buf)?;
+            reader.read_exact(&mut name_buf).await?;
             let mut seq_id_bytes = [0u8; 4];
-            reader.read_exact(&mut seq_id_bytes)?;
+            reader.read_exact(&mut seq_id_bytes).await?;
+
+            // Read field-by-field using the async helper.
             let mut body: Vec<u8> = Vec::with_capacity(256);
-            read_buffered_struct_body(reader, &mut body)?;
+            read_buffered_struct_body_async(reader, &mut body).await?;
+
             let mut frame = Vec::with_capacity(4 + 4 + name_len + 4 + body.len());
             frame.extend_from_slice(&hdr);
             frame.extend_from_slice(&name_len_bytes);
@@ -352,6 +380,90 @@ fn conn_recv_frame(
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Async buffered-transport body reader (duplicated from server for client use)
+// ──────────────────────────────────────────────────────────────────────────────
+
+async fn read_buffered_struct_body_async<R>(
+    reader: &mut R,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    loop {
+        let field_type_byte = reader.read_u8().await?;
+        out.push(field_type_byte);
+        if field_type_byte == 0x00 {
+            return Ok(());
+        }
+        let id_hi = reader.read_u8().await?;
+        let id_lo = reader.read_u8().await?;
+        out.push(id_hi);
+        out.push(id_lo);
+        read_buffered_value_async(reader, field_type_byte, out).await?;
+    }
+}
+
+async fn read_buffered_value_async<R>(
+    reader: &mut R,
+    field_type_byte: u8,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+{
+    match field_type_byte {
+        0x02 | 0x03 => { let b = reader.read_u8().await?; out.push(b); }
+        0x06 => { let mut buf = [0u8; 2]; reader.read_exact(&mut buf).await?; out.extend_from_slice(&buf); }
+        0x08 => { let mut buf = [0u8; 4]; reader.read_exact(&mut buf).await?; out.extend_from_slice(&buf); }
+        0x0a | 0x04 => { let mut buf = [0u8; 8]; reader.read_exact(&mut buf).await?; out.extend_from_slice(&buf); }
+        0x0b => {
+            let mut len_bytes = [0u8; 4];
+            reader.read_exact(&mut len_bytes).await?;
+            out.extend_from_slice(&len_bytes);
+            let len = u32::from_be_bytes(len_bytes) as usize;
+            let start = out.len();
+            out.resize(start + len, 0);
+            reader.read_exact(&mut out[start..]).await?;
+        }
+        0x0c => { Box::pin(read_buffered_struct_body_async(reader, out)).await?; }
+        0x0d => {
+            let mut header = [0u8; 6];
+            reader.read_exact(&mut header).await?;
+            out.extend_from_slice(&header);
+            let key_type = header[0];
+            let val_type = header[1];
+            let size = i32::from_be_bytes([header[2], header[3], header[4], header[5]]);
+            for _ in 0..size {
+                Box::pin(read_buffered_value_async(reader, key_type, out)).await?;
+                Box::pin(read_buffered_value_async(reader, val_type, out)).await?;
+            }
+        }
+        0x0f | 0x0e => {
+            let mut header = [0u8; 5];
+            reader.read_exact(&mut header).await?;
+            out.extend_from_slice(&header);
+            let elem_type = header[0];
+            let size = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            for _ in 0..size {
+                Box::pin(read_buffered_value_async(reader, elem_type, out)).await?;
+            }
+        }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown field type byte 0x{:02x}", field_type_byte),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Application-exception decoder (sync, cursor-based — no change needed)
+// ──────────────────────────────────────────────────────────────────────────────
 
 fn read_application_exception<R: std::io::Read>(
     reader: &mut BinaryProtocolReader<R>,

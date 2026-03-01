@@ -1,6 +1,16 @@
 pub mod binary;
+pub mod compact;
+pub mod json;
 pub mod types;
 
-pub use binary::{BinaryProtocolReader, BinaryProtocolWriter, ProtocolError, MessageBegin,
-                 MESSAGE_TYPE_CALL, MESSAGE_TYPE_REPLY, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY};
-pub use types::*;
+pub use types::{
+    FieldBegin, ListBegin, MapBegin, MessageBegin, ProtocolError, SetBegin, TInputProtocol,
+    TOutputProtocol, TType,
+};
+pub use binary::{
+    BinaryProtocolReader, BinaryProtocolWriter,
+    MESSAGE_TYPE_CALL, MESSAGE_TYPE_REPLY, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY,
+    THRIFT_VERSION_1,
+};
+pub use compact::{CompactProtocolReader, CompactProtocolWriter};
+pub use json::{JSONProtocolReader, JSONProtocolWriter};

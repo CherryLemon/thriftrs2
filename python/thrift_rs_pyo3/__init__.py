@@ -1,6 +1,8 @@
 from .thrift_rs_pyo3 import (
     ThriftParser,
     BinaryProtocol,
+    CompactProtocol,
+    ProtocolType,
     ThriftStruct,
     ThriftField,
     PyThriftService,
@@ -12,12 +14,15 @@ from .thrift_rs_pyo3 import (
     ThriftApplicationException,
 )
 from .loader import load, make_client, make_server
-from .protocol import TBinaryProtocol, TFramedTransport, TBufferedTransport, serialize, deserialize
+from .protocol import TBinaryProtocol, TCompactProtocol, TFramedTransport, TBufferedTransport, serialize, deserialize, loads, dumps
 
 __version__ = "0.1.0"
 __all__ = [
     "ThriftParser",
     "BinaryProtocol",
+    "CompactProtocol",
+    "JSONProtocol",
+    "ProtocolType",
     "ThriftStruct",
     "ThriftField",
     "PyThriftService",
@@ -34,5 +39,8 @@ __all__ = [
     "make_server",
     "deserialize",
     "serialize",
+    "loads",
+    "dumps",
     "TBinaryProtocol",
+    "TCompactProtocol",
 ]
