@@ -1,14 +1,17 @@
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyBytes, PyList};
-use pyo3::Py;
-use crate::parser::{Parser, ast::*};
-use crate::protocol::{BinaryProtocolReader, BinaryProtocolWriter, TType, FieldBegin,
-                      MESSAGE_TYPE_REPLY, MESSAGE_TYPE_EXCEPTION,
-                      ListBegin, SetBegin, MapBegin};
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::Arc;
+use crate::parser::{ast::*, Parser};
+use crate::protocol::{
+    BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, ListBegin, MapBegin, SetBegin, TType,
+    MESSAGE_TYPE_CALL, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_REPLY,
+};
 use byteorder::BigEndian;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::Py;
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Cursor, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 // ──────────────────────────────────────────────────────────────────────────────
 // ThriftParser
 // ──────────────────────────────────────────────────────────────────────────────
@@ -26,11 +29,13 @@ impl ThriftParser {
     }
 
     pub fn parse(&mut self, content: &str) -> PyResult<()> {
-        let mut parser = Parser::new(content)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {}", e)))?;
+        let mut parser = Parser::new(content).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {}", e))
+        })?;
 
-        self.document = Some(parser.parse_document()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {}", e)))?);
+        self.document = Some(parser.parse_document().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Parse error: {}", e))
+        })?);
 
         Ok(())
     }
@@ -38,77 +43,103 @@ impl ThriftParser {
     pub fn list_structs(&self) -> PyResult<Vec<String>> {
         match &self.document {
             Some(doc) => Ok(doc.structs.keys().cloned().collect()),
-            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No document parsed yet")),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
         }
     }
 
     pub fn get_struct(&self, name: &str) -> PyResult<Option<ThriftStruct>> {
         match &self.document {
-            Some(doc) => {
-                Ok(doc.structs.get(name).map(|s| {
-                    let fields: Vec<ThriftField> = s.fields.iter().map(|f| ThriftField {
+            Some(doc) => Ok(doc.structs.get(name).map(|s| {
+                let fields: Vec<ThriftField> = s
+                    .fields
+                    .iter()
+                    .map(|f| ThriftField {
                         id: f.id,
                         name: f.name.clone(),
                         required: f.required,
                         field_type: f.field_type.clone(),
-                    }).collect();
-                    let field_map: HashMap<i16, usize> = fields.iter()
-                        .enumerate()
-                        .map(|(idx, f)| (f.id, idx))
-                        .collect();
-                    ThriftStruct {
-                        name: s.name.clone(),
-                        fields,
-                        field_map,
-                        struct_map: Arc::new(HashMap::new()),
-                    }
-                }))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No document parsed yet")),
+                    })
+                    .collect();
+                let field_map: HashMap<i16, usize> = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, f)| (f.id, idx))
+                    .collect();
+                ThriftStruct {
+                    name: s.name.clone(),
+                    fields,
+                    field_map,
+                    struct_map: Arc::new(HashMap::new()),
+                }
+            })),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
         }
     }
 
     pub fn list_services(&self) -> PyResult<Vec<String>> {
         match &self.document {
             Some(doc) => Ok(doc.services.keys().cloned().collect()),
-            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No document parsed yet")),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
         }
     }
 
     pub fn get_service(&self, name: &str) -> PyResult<Option<PyThriftService>> {
         match &self.document {
-            Some(doc) => {
-                Ok(doc.services.get(name).map(|svc| {
-                    let methods: Vec<PyThriftMethod> = svc.methods.iter().map(|m| {
-                        let args: Vec<ThriftField> = m.arguments.iter().map(|f| ThriftField {
-                            id: f.id,
-                            name: f.name.clone(),
-                            required: f.required,
-                            field_type: f.field_type.clone(),
-                        }).collect();
-                        let exceptions: Vec<ThriftField> = m.exceptions.iter().map(|f| ThriftField {
-                            id: f.id,
-                            name: f.name.clone(),
-                            required: f.required,
-                            field_type: f.field_type.clone(),
-                        }).collect();
+            Some(doc) => Ok(doc.services.get(name).map(|svc| {
+                let methods: Vec<PyThriftMethod> = svc
+                    .methods
+                    .iter()
+                    .map(|m| {
+                        let args: Vec<ThriftField> = m
+                            .arguments
+                            .iter()
+                            .map(|f| ThriftField {
+                                id: f.id,
+                                name: f.name.clone(),
+                                required: f.required,
+                                field_type: f.field_type.clone(),
+                            })
+                            .collect();
+                        let exceptions: Vec<ThriftField> = m
+                            .exceptions
+                            .iter()
+                            .map(|f| ThriftField {
+                                id: f.id,
+                                name: f.name.clone(),
+                                required: f.required,
+                                field_type: f.field_type.clone(),
+                            })
+                            .collect();
+                        let arg_field_map: HashMap<i16, usize> = args
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| (f.id, i))
+                            .collect();
                         PyThriftMethod {
                             name: m.name.clone(),
                             return_type: m.return_type.clone(),
                             arguments: args,
                             exceptions,
+                            arg_field_map,
                         }
-                    }).collect();
-                    PyThriftService {
-                        name: svc.name.clone(),
-                        methods,
-                    }
-                }))
-            }
-            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>("No document parsed yet")),
+                    })
+                    .collect();
+                PyThriftService {
+                    name: svc.name.clone(),
+                    methods,
+                }
+            })),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
         }
     }
-
 }
 
 impl ThriftParser {
@@ -116,38 +147,56 @@ impl ThriftParser {
     /// can resolve nested struct types by name during serialisation/deserialisation.
     pub(crate) fn struct_map(&self) -> Arc<HashMap<String, ThriftStruct>> {
         let map: HashMap<String, ThriftStruct> = match &self.document {
-            Some(doc) => doc.structs.iter().map(|(k, s)| {
-                let fields: Vec<ThriftField> = s.fields.iter().map(|f| ThriftField {
-                    id: f.id,
-                    name: f.name.clone(),
-                    required: f.required,
-                    field_type: f.field_type.clone(),
-                }).collect();
-                let field_map: HashMap<i16, usize> = fields.iter()
-                    .enumerate()
-                    .map(|(idx, f)| (f.id, idx))
-                    .collect();
-                (k.clone(), ThriftStruct {
-                    name: s.name.clone(),
-                    fields,
-                    field_map,
-                    struct_map: Arc::new(HashMap::new()), // filled in below
+            Some(doc) => doc
+                .structs
+                .iter()
+                .map(|(k, s)| {
+                    let fields: Vec<ThriftField> = s
+                        .fields
+                        .iter()
+                        .map(|f| ThriftField {
+                            id: f.id,
+                            name: f.name.clone(),
+                            required: f.required,
+                            field_type: f.field_type.clone(),
+                        })
+                        .collect();
+                    let field_map: HashMap<i16, usize> = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, f)| (f.id, idx))
+                        .collect();
+                    (
+                        k.clone(),
+                        ThriftStruct {
+                            name: s.name.clone(),
+                            fields,
+                            field_map,
+                            struct_map: Arc::new(HashMap::new()), // filled in below
+                        },
+                    )
                 })
-            }).collect(),
+                .collect(),
             None => HashMap::new(),
         };
         // Now wrap in Arc and back-patch each ThriftStruct with the shared map.
         let arc = Arc::new(map);
         // Re-build with back-reference so ThriftStruct::new_instance can use it.
         // We reconstruct a new map where every ThriftStruct has struct_map set.
-        let patched: HashMap<String, ThriftStruct> = arc.iter().map(|(k, s)| {
-            (k.clone(), ThriftStruct {
-                name: s.name.clone(),
-                fields: s.fields.clone(),
-                field_map: s.field_map.clone(),
-                struct_map: Arc::clone(&arc),
+        let patched: HashMap<String, ThriftStruct> = arc
+            .iter()
+            .map(|(k, s)| {
+                (
+                    k.clone(),
+                    ThriftStruct {
+                        name: s.name.clone(),
+                        fields: s.fields.clone(),
+                        field_map: s.field_map.clone(),
+                        struct_map: Arc::clone(&arc),
+                    },
+                )
             })
-        }).collect();
+            .collect();
         Arc::new(patched)
     }
 }
@@ -175,18 +224,34 @@ impl ThriftStruct {
     /// construct an empty ThriftStructInstance with all fields set to None.
     pub fn new_instance(&self, _py: Python<'_>) -> ThriftStructInstance {
         let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self.fields.iter()
+        let schema: HashMap<String, ThriftField> = self
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
-        ThriftStructInstance::empty(self.name.clone(), field_names, schema, Arc::clone(&self.struct_map))
+        ThriftStructInstance::empty(
+            self.name.clone(),
+            field_names,
+            schema,
+            Arc::clone(&self.struct_map),
+        )
     }
-    pub fn new_instance_from_dict(&self, py: Python<'_>, items: &Bound<'_, PyDict>) -> ThriftStructInstance {
+    pub fn new_instance_from_dict(
+        &self,
+        py: Python<'_>,
+        items: &Bound<'_, PyDict>,
+    ) -> ThriftStructInstance {
         let field_names: Vec<String> = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self.fields.iter()
+        let schema: HashMap<String, ThriftField> = self
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
         let mut instance = ThriftStructInstance::empty(
-            self.name.clone(), field_names, schema.clone(), Arc::clone(&self.struct_map),
+            self.name.clone(),
+            field_names,
+            schema.clone(),
+            Arc::clone(&self.struct_map),
         );
         for (k, v) in items.iter() {
             if let Ok(name) = k.extract::<String>() {
@@ -195,7 +260,11 @@ impl ThriftStruct {
                     instance.cache.insert(name.clone(), v.clone().unbind());
                     // Populate inner (GIL-free serialisation path), schema-aware
                     let tv_result = if let Some(field) = schema.get(&name) {
-                        py_any_to_thrift_value_with_type(&v, &field.field_type.clone(), &self.struct_map)
+                        py_any_to_thrift_value_with_type(
+                            &v,
+                            &field.field_type.clone(),
+                            &self.struct_map,
+                        )
                     } else {
                         py_any_to_thrift_value(&v)
                     };
@@ -209,15 +278,26 @@ impl ThriftStruct {
         instance
     }
     #[pyo3(signature = (**kwargs))]
-    pub fn __call__(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> ThriftStructInstance {
+    pub fn __call__(
+        &self,
+        py: Python<'_>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> ThriftStructInstance {
         let field_names = self.fields.iter().map(|f| f.name.clone()).collect();
-        let schema: HashMap<String, ThriftField> = self.fields.iter()
+        let schema: HashMap<String, ThriftField> = self
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
         if let Some(kw) = kwargs {
             self.new_instance_from_dict(py, kw)
         } else {
-            ThriftStructInstance::empty(self.name.clone(), field_names, schema, Arc::clone(&self.struct_map))
+            ThriftStructInstance::empty(
+                self.name.clone(),
+                field_names,
+                schema,
+                Arc::clone(&self.struct_map),
+            )
         }
     }
 
@@ -226,26 +306,42 @@ impl ThriftStruct {
         let mut buffer = Vec::with_capacity(128 + self.fields.len() * 16);
         let mut writer = BinaryProtocolWriter::new(&mut buffer);
         serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
-        writer.write_field_stop()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+        writer.write_field_stop().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+        })?;
         Ok(buffer)
     }
 
     /// Deserialize bytes into a `ThriftStructInstance`.
-    pub fn deserialize<'py>(&self, py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, ThriftStructInstance>> {
+    pub fn deserialize<'py>(
+        &self,
+        py: Python<'py>,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, ThriftStructInstance>> {
         let mut cursor = Cursor::new(data);
         let mut reader = BinaryProtocolReader::new(&mut cursor);
-        let schema: HashMap<String, ThriftField> = self.fields.iter()
+        let schema: HashMap<String, ThriftField> = self
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f.clone()))
             .collect();
         deserialize_struct_fields_as_instance(
-            &mut reader, &self.fields, &self.field_map,
-            &self.struct_map, py, &self.name, schema, Arc::clone(&self.struct_map),
+            &mut reader,
+            &self.fields,
+            &self.field_map,
+            &self.struct_map,
+            py,
+            &self.name,
+            schema,
+            Arc::clone(&self.struct_map),
         )
     }
 
     pub fn __repr__(&self) -> String {
-        format!("ThriftStruct(name={:?}, fields={:?})", self.name, self.fields)
+        format!(
+            "ThriftStruct(name={:?}, fields={:?})",
+            self.name, self.fields
+        )
     }
 }
 
@@ -264,7 +360,10 @@ pub struct ThriftField {
 #[pymethods]
 impl ThriftField {
     pub fn __repr__(&self) -> String {
-        format!("ThriftField(id={}, name={:?}, required={}, field_type={:?})", self.id, self.name, self.required, self.field_type)
+        format!(
+            "ThriftField(id={}, name={:?}, required={}, field_type={:?})",
+            self.id, self.name, self.required, self.field_type
+        )
     }
 }
 
@@ -283,7 +382,11 @@ pub struct RustStructValue {
 
 impl RustStructValue {
     pub fn empty(struct_name: String, field_names: Vec<String>) -> Self {
-        Self { struct_name, field_names, values: HashMap::new() }
+        Self {
+            struct_name,
+            field_names,
+            values: HashMap::new(),
+        }
     }
     pub fn set_field(&mut self, name: &str, value: ThriftValue) {
         self.values.insert(name.to_string(), value);
@@ -326,7 +429,9 @@ impl Clone for ThriftStructInstance {
             struct_name: self.struct_name.clone(),
             field_names: self.field_names.clone(),
             inner: self.inner.clone(),
-            cache: self.cache.iter()
+            cache: self
+                .cache
+                .iter()
                 .map(|(k, v)| (k.clone(), v.clone_ref(py)))
                 .collect(),
             schema: self.schema.clone(),
@@ -345,7 +450,14 @@ impl ThriftStructInstance {
     ) -> Self {
         let struct_name = inner.struct_name.clone();
         let field_names = inner.field_names.clone();
-        Self { struct_name, field_names, inner, cache: HashMap::new(), schema, struct_map }
+        Self {
+            struct_name,
+            field_names,
+            inner,
+            cache: HashMap::new(),
+            schema,
+            struct_map,
+        }
     }
 
     /// Construct an empty instance (no inner values, empty cache).
@@ -356,7 +468,14 @@ impl ThriftStructInstance {
         struct_map: Arc<HashMap<String, ThriftStruct>>,
     ) -> Self {
         let inner = RustStructValue::empty(struct_name.clone(), field_names.clone());
-        Self { struct_name, field_names, inner, cache: HashMap::new(), schema, struct_map }
+        Self {
+            struct_name,
+            field_names,
+            inner,
+            cache: HashMap::new(),
+            schema,
+            struct_map,
+        }
     }
 
     /// Set a field value from a native `ThriftValue` (used during deser).
@@ -415,7 +534,8 @@ impl ThriftStructInstance {
 
     pub fn __getattr__(&mut self, py: Python<'_>, name: &str) -> PyResult<Py<PyAny>> {
         if self.field_names.contains(&name.to_string()) {
-            Ok(self.get_field(py, name)
+            Ok(self
+                .get_field(py, name)
                 .map(|v| v.unbind())
                 .unwrap_or_else(|| py.None()))
         } else {
@@ -453,12 +573,16 @@ impl ThriftStructInstance {
 
     pub fn __repr__(&mut self, py: Python<'_>) -> String {
         let names = self.field_names.clone();
-        let fields: Vec<String> = names.iter().map(|name| {
-            let val = self.get_field(py, name)
-                .map(|v| format!("{:?}", v))
-                .unwrap_or_else(|| "None".to_string());
-            format!("{}={}", name, val)
-        }).collect();
+        let fields: Vec<String> = names
+            .iter()
+            .map(|name| {
+                let val = self
+                    .get_field(py, name)
+                    .map(|v| format!("{:?}", v))
+                    .unwrap_or_else(|| "None".to_string());
+                format!("{}={}", name, val)
+            })
+            .collect();
         format!("{}({})", self.struct_name, fields.join(", "))
     }
 
@@ -466,7 +590,8 @@ impl ThriftStructInstance {
         let d = PyDict::new(py);
         let names = self.field_names.clone();
         for name in &names {
-            let v = self.get_field(py, name)
+            let v = self
+                .get_field(py, name)
                 .unwrap_or_else(|| py.None().into_bound(py));
             d.set_item(name, v)?;
         }
@@ -499,7 +624,10 @@ impl PyThriftService {
 
     pub fn __repr__(&self) -> String {
         let method_names: Vec<&str> = self.methods.iter().map(|m| m.name.as_str()).collect();
-        format!("ThriftService(name={:?}, methods={:?})", self.name, method_names)
+        format!(
+            "ThriftService(name={:?}, methods={:?})",
+            self.name, method_names
+        )
     }
 }
 
@@ -513,12 +641,18 @@ pub struct PyThriftMethod {
     #[pyo3(get)]
     pub exceptions: Vec<ThriftField>,
     pub(crate) return_type: ThriftType,
+    /// Pre-computed field-id → index map for argument deserialisation.
+    /// Built once at parse time so the hot `handle_connection` path never allocates it.
+    pub(crate) arg_field_map: HashMap<i16, usize>,
 }
 
 #[pymethods]
 impl PyThriftMethod {
     pub fn __repr__(&self) -> String {
-        format!("ThriftMethod(name={:?}, return_type={:?})", self.name, self.return_type)
+        format!(
+            "ThriftMethod(name={:?}, return_type={:?})",
+            self.name, self.return_type
+        )
     }
 }
 
@@ -537,12 +671,20 @@ impl BinaryProtocol {
     }
 
     #[staticmethod]
-    pub fn serialize_struct(py: Python<'_>, struct_def: &ThriftStruct, data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    pub fn serialize_struct(
+        py: Python<'_>,
+        struct_def: &ThriftStruct,
+        data: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<u8>> {
         struct_def.serialize(py, data)
     }
 
     #[staticmethod]
-    pub fn deserialize_struct<'py>(py: Python<'py>, struct_def: &ThriftStruct, data: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    pub fn deserialize_struct<'py>(
+        py: Python<'py>,
+        struct_def: &ThriftStruct,
+        data: &[u8],
+    ) -> PyResult<Bound<'py, PyAny>> {
         struct_def.deserialize(py, data).map(|d| d.into_any())
     }
 }
@@ -586,6 +728,9 @@ pub struct ThriftServer {
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     /// Transport type to use (framed or buffered).
     transport: TransportType,
+    /// Number of worker threads in the connection-handler pool.
+    /// 0 means use the number of logical CPUs.
+    workers: usize,
 }
 
 #[pymethods]
@@ -598,6 +743,7 @@ impl ThriftServer {
             handlers: HashMap::new(),
             struct_map: Arc::new(HashMap::new()),
             transport,
+            workers: 1,
         }
     }
 
@@ -613,6 +759,19 @@ impl ThriftServer {
         self.transport = transport;
     }
 
+    /// Get the number of worker threads (0 = auto / number of logical CPUs).
+    #[getter]
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    /// Set the number of worker threads in the connection-handler pool.
+    /// Set to 0 to use the number of logical CPUs (default).
+    #[setter]
+    pub fn set_workers(&mut self, workers: usize) {
+        self.workers = workers;
+    }
+
     /// Attach the parser so that nested struct types can be resolved.
     pub fn set_parser(&mut self, parser: &ThriftParser) {
         self.struct_map = parser.struct_map();
@@ -624,7 +783,7 @@ impl ThriftServer {
     }
 
     /// Start a **blocking** TCP server on `host:port`.
-    /// Each connection is handled in its own OS thread.
+    /// Connections are handled by a fixed-size worker-thread pool.
     /// Releases the GIL while waiting for connections.
     pub fn serve(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
         use std::net::TcpListener;
@@ -633,37 +792,34 @@ impl ThriftServer {
 
         // Clone handlers while we still hold the GIL.
         let service = self.service.clone();
-        let handlers: HashMap<String, Py<PyAny>> = self.handlers.iter()
+        let handlers: HashMap<String, Py<PyAny>> = self
+            .handlers
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone_ref(py)))
             .collect();
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
+        let n_workers = if self.workers == 0 {
+            num_cpus::get().max(2)
+        } else {
+            self.workers
+        };
 
-        let listener = TcpListener::bind(&addr)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("bind error: {}", e)))?;
+        let listener = TcpListener::bind(&addr).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("bind error: {}", e))
+        })?;
 
-        println!("ThriftServer ({:?}) listening on {}", transport, addr);
+        println!(
+            "ThriftServer ({:?}, {} workers) listening on {}",
+            transport, n_workers, addr
+        );
 
         let service = Arc::new(service);
         let handlers = Arc::new(handlers);
 
         // Release the GIL while blocking in accept loop.
         py.detach(|| {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let service = Arc::clone(&service);
-                        let handlers = Arc::clone(&handlers);
-                        let struct_map = Arc::clone(&struct_map);
-                        std::thread::spawn(move || {
-                            if let Err(e) = handle_connection(stream, &service, &handlers, &struct_map, transport) {
-                                eprintln!("Connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => eprintln!("Accept error: {}", e),
-                }
-            }
+            run_server_pool(listener, service, handlers, struct_map, transport, n_workers);
         });
 
         Ok(())
@@ -676,39 +832,88 @@ impl ThriftServer {
 
         let addr = format!("{}:{}", host, port);
         let service = self.service.clone();
-        let handlers: HashMap<String, Py<PyAny>> = self.handlers.iter()
+        let handlers: HashMap<String, Py<PyAny>> = self
+            .handlers
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone_ref(py)))
             .collect();
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
+        let n_workers = if self.workers == 0 {
+            num_cpus::get().max(2)
+        } else {
+            self.workers
+        };
 
-        let listener = TcpListener::bind(&addr)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("bind error: {}", e)))?;
+        let listener = TcpListener::bind(&addr).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("bind error: {}", e))
+        })?;
 
-        println!("ThriftServer (non-blocking, {:?}) listening on {}", transport, addr);
+        println!(
+            "ThriftServer (non-blocking, {:?}, {} workers) listening on {}",
+            transport, n_workers, addr
+        );
 
         let service = Arc::new(service);
         let handlers = Arc::new(handlers);
 
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let service = Arc::clone(&service);
-                        let handlers = Arc::clone(&handlers);
-                        let struct_map = Arc::clone(&struct_map);
-                        std::thread::spawn(move || {
-                            if let Err(e) = handle_connection(stream, &service, &handlers, &struct_map, transport) {
-                                eprintln!("Connection error: {}", e);
-                            }
-                        });
-                    }
-                    Err(e) => eprintln!("Accept error: {}", e),
-                }
-            }
+            run_server_pool(listener, service, handlers, struct_map, transport, n_workers);
         });
 
         Ok(())
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Thread-pool server helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Spin up a fixed-size pool of worker threads and an accept loop.
+/// Accepted connections are dispatched to workers via a channel.
+fn run_server_pool(
+    listener: std::net::TcpListener,
+    service: Arc<PyThriftService>,
+    handlers: Arc<HashMap<String, Py<PyAny>>>,
+    struct_map: Arc<HashMap<String, ThriftStruct>>,
+    transport: TransportType,
+    n_workers: usize,
+) {
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<TcpStream>();
+    let rx = Arc::new(Mutex::new(rx));
+
+    for _ in 0..n_workers {
+        let rx = Arc::clone(&rx);
+        let service = Arc::clone(&service);
+        let handlers = Arc::clone(&handlers);
+        let struct_map = Arc::clone(&struct_map);
+        std::thread::spawn(move || loop {
+            let stream = match rx.lock().unwrap().recv() {
+                Ok(s) => s,
+                Err(_) => break, // channel closed
+            };
+            if let Err(e) =
+                handle_connection(stream, &service, &handlers, &struct_map, transport)
+            {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof
+                    && e.kind() != std::io::ErrorKind::ConnectionReset
+                    && e.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    eprintln!("Connection error: {}", e);
+                }
+            }
+        });
+    }
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let _ = tx.send(stream);
+            }
+            Err(e) => eprintln!("Accept error: {}", e),
+        }
     }
 }
 
@@ -723,84 +928,52 @@ fn handle_connection(
     struct_map: &Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
 ) -> std::io::Result<()> {
-    use std::io::{Read, BufReader};
-    use byteorder::{ReadBytesExt, WriteBytesExt};
+    use byteorder::ReadBytesExt;
+    use std::io::Read;
 
-    // For buffered transport we wrap the stream in a BufReader so we can do
-    // efficient byte-at-a-time reads without syscall overhead, while still
-    // sharing the same underlying TCP stream for writes.
-    //
-    // We use an enum to avoid monomorphisation or Box<dyn Read> overhead in
-    // the common case; both arms dispatch the same logic below.
-    enum StreamReader {
-        Framed(std::net::TcpStream),
-        Buffered(BufReader<std::net::TcpStream>),
-    }
+    // TCP_NODELAY eliminates Nagle-algorithm batching latency.
+    let _ = stream.set_nodelay(true);
 
-    // We need the raw stream for writes; keep a separate clone/reference.
-    // TcpStream can be cloned to give independent read/write ends.
-    let write_stream = stream.try_clone()
-        .map_err(|e| std::io::Error::new(e.kind(), format!("clone stream: {}", e)))?;
-    let mut write_stream = write_stream;
+    // Clone for independent read/write handles.
+    let write_stream = stream.try_clone()?;
 
-    let mut reader_holder = match transport {
-        TransportType::Framed => StreamReader::Framed(stream),
-        TransportType::Buffered => {
-            // Wrap the original stream in a BufReader for buffered reads.
-            StreamReader::Buffered(BufReader::new(stream))
-        }
-    };
+    // Always wrap read side in BufReader – efficient for both framed and buffered transports.
+    let mut buf_reader = BufReader::with_capacity(65536, stream);
+    // BufWriter coalesces header + payload into a single flush() syscall.
+    let mut buf_writer = BufWriter::with_capacity(65536, write_stream);
 
     loop {
-        // ── Read the next message payload ────────────────────────────────────
-        let frame: Vec<u8> = match &mut reader_holder {
-            StreamReader::Framed(s) => {
-                // Framed transport: 4-byte big-endian length prefix followed by payload.
-                let frame_len = match s.read_i32::<BigEndian>() {
+        // ── Read the next message payload ─────────────────────────────────────
+        let frame: Vec<u8> = match transport {
+            TransportType::Framed => {
+                let frame_len = match buf_reader.read_i32::<BigEndian>() {
                     Ok(n) if n > 0 => n as usize,
-                    Ok(_) => return Ok(()),   // graceful close / zero-length
+                    Ok(_) => return Ok(()),
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(e) => return Err(e),
                 };
                 let mut buf = vec![0u8; frame_len];
-                s.read_exact(&mut buf)?;
+                buf_reader.read_exact(&mut buf)?;
                 buf
             }
-            StreamReader::Buffered(r) => {
-                // Buffered transport: no framing envelope.  We peek at the
-                // first 4 bytes to detect the Thrift binary protocol magic
-                // (0x80 0x01 ...) and then read the full message by re-parsing
-                // the header to find the total on-wire length.
-                //
-                // Strategy: read the 4-byte version/type word first, then the
-                // method-name length, then the name, then seq_id (4 bytes),
-                // then the struct body up to the final STOP byte.  We
-                // reassemble everything into a contiguous buffer so the rest
-                // of the dispatch path is identical to the framed branch.
-
-                // 1. Read version+type (4 bytes)
+            TransportType::Buffered => {
                 let mut hdr = [0u8; 4];
-                match r.read_exact(&mut hdr) {
+                match buf_reader.read_exact(&mut hdr) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(e) => return Err(e),
                 }
-
-                // 2. Read name length (4 bytes) + name + seq_id (4 bytes)
                 let mut name_len_bytes = [0u8; 4];
-                r.read_exact(&mut name_len_bytes)?;
+                buf_reader.read_exact(&mut name_len_bytes)?;
                 let name_len = i32::from_be_bytes(name_len_bytes) as usize;
                 let mut name_buf = vec![0u8; name_len];
-                r.read_exact(&mut name_buf)?;
+                buf_reader.read_exact(&mut name_buf)?;
                 let mut seq_id_bytes = [0u8; 4];
-                r.read_exact(&mut seq_id_bytes)?;
+                buf_reader.read_exact(&mut seq_id_bytes)?;
 
-                // 3. Slurp the struct body until we hit STOP (0x00) at depth 0.
-                //    We track nesting depth to handle nested structs.
                 let mut body: Vec<u8> = Vec::with_capacity(256);
-                read_buffered_struct_body(r, &mut body)?;
+                read_buffered_struct_body(&mut buf_reader, &mut body)?;
 
-                // 4. Reassemble the full frame.
                 let mut frame = Vec::with_capacity(4 + 4 + name_len + 4 + body.len());
                 frame.extend_from_slice(&hdr);
                 frame.extend_from_slice(&name_len_bytes);
@@ -811,36 +984,34 @@ fn handle_connection(
             }
         };
 
-        // ── Parse message header ─────────────────────────────────────────────
+        // ── Parse message header ──────────────────────────────────────────────
         let mut cursor = Cursor::new(&frame[..]);
         let mut reader = BinaryProtocolReader::new(&mut cursor);
-        let msg_begin = reader.read_message_begin()
+        let msg_begin = reader
+            .read_message_begin()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         // ── Find method definition ────────────────────────────────────────────
         let method_def = service.methods.iter().find(|m| m.name == msg_begin.name);
 
         let response_payload = match method_def {
-            None => {
-                build_exception_reply(&msg_begin.name, msg_begin.seq_id,
-                    1, &format!("Unknown method: {}", msg_begin.name))
-            }
+            None => build_exception_reply(
+                &msg_begin.name,
+                msg_begin.seq_id,
+                1,
+                &format!("Unknown method: {}", msg_begin.name),
+            ),
             Some(method) => {
-                // ── Deserialise arguments  (GIL-free) ────────────────────────
-                let arg_field_map: HashMap<i16, usize> = method.arguments.iter()
-                    .enumerate()
-                    .map(|(i, f)| (f.id, i))
-                    .collect();
-
-                // Deserialise directly into RustStructValue — no Python objects.
+                // ── Deserialise arguments (GIL-free) ─────────────────────────
+                // Use pre-computed arg_field_map — no per-request HashMap allocation.
                 let args_rust = deserialize_rust_struct(
                     &mut reader,
                     &method.arguments,
-                    &arg_field_map,
+                    &method.arg_field_map,
                     struct_map,
-                ).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+                )
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-                // Give the RustStructValue the correct struct_name for the args.
                 let args_rust = RustStructValue {
                     struct_name: format!("{}_args", msg_begin.name),
                     field_names: args_rust.field_names,
@@ -851,36 +1022,34 @@ fn handle_connection(
                 let handler = match handlers.get(&msg_begin.name) {
                     Some(h) => h,
                     None => {
-                        let payload = build_exception_reply(&msg_begin.name, msg_begin.seq_id,
-                            1, &format!("No handler registered for: {}", msg_begin.name));
-                        send_response(&mut write_stream, &payload, transport)?;
+                        let payload = build_exception_reply(
+                            &msg_begin.name,
+                            msg_begin.seq_id,
+                            1,
+                            &format!("No handler registered for: {}", msg_begin.name),
+                        );
+                        send_response_buffered(&mut buf_writer, &payload, transport)?;
                         continue;
                     }
                 };
 
-                // ── Single GIL block: bind args, call handler, serialise reply
+                // ── Single GIL block: bind args, call handler, serialise reply ─
                 let result: Result<Vec<u8>, String> = Python::attach(|py| {
-                    // Build schema from method arguments for type-aware __setattr__.
-                    let schema: HashMap<String, ThriftField> = method.arguments.iter()
+                    let schema: HashMap<String, ThriftField> = method
+                        .arguments
+                        .iter()
                         .map(|f| (f.name.clone(), f.clone()))
                         .collect();
-                    // Wrap the RustStructValue in a ThriftStructInstance (no-copy inner move).
-                    let args_instance = ThriftStructInstance::from_rust(
-                        args_rust,
-                        schema,
-                        Arc::clone(struct_map),
-                    );
+                    let args_instance =
+                        ThriftStructInstance::from_rust(args_rust, schema, Arc::clone(struct_map));
                     let py_args = Bound::new(py, args_instance)?;
 
-                    // Build **kwargs dict mapping field name -> instance attribute.
-                    // We call the handler with the instance's fields as kwargs so
-                    // existing handler signatures (def method(self, arg1, arg2)) work.
                     let kwargs = pyo3::types::PyDict::new(py);
-                    // Re-borrow so we can call get_field.
                     let mut inst_borrow = py_args.borrow_mut();
                     let field_names: Vec<String> = inst_borrow.field_names.clone();
                     for name in &field_names {
-                        let val = inst_borrow.get_field(py, name)
+                        let val = inst_borrow
+                            .get_field(py, name)
                             .map(|v| v.unbind())
                             .unwrap_or_else(|| py.None());
                         kwargs.set_item(name, val)?;
@@ -888,35 +1057,49 @@ fn handle_connection(
                     drop(inst_borrow);
 
                     let result = handler.call(py, (), Some(&kwargs))?;
-                    let reply_body = build_reply_body(py, &method.return_type, result.bind(py), struct_map)?;
-                    Ok(build_reply_frame(&msg_begin.name, msg_begin.seq_id, &reply_body))
-                }).map_err(|e: PyErr| e.to_string());
+                    let reply_body =
+                        build_reply_body(py, &method.return_type, result.bind(py), struct_map)?;
+                    Ok(build_reply_frame(
+                        &msg_begin.name,
+                        msg_begin.seq_id,
+                        &reply_body,
+                    ))
+                })
+                .map_err(|e: PyErr| e.to_string());
 
                 match result {
                     Ok(frame) => frame,
-                    Err(err_msg) => build_exception_reply(&msg_begin.name, msg_begin.seq_id, 6, &err_msg),
+                    Err(err_msg) => {
+                        build_exception_reply(&msg_begin.name, msg_begin.seq_id, 6, &err_msg)
+                    }
                 }
             }
         };
 
-        send_response(&mut write_stream, &response_payload, transport)?;
+        send_response_buffered(&mut buf_writer, &response_payload, transport)?;
     }
 }
 
-fn send_response(stream: &mut std::net::TcpStream, payload: &[u8], transport: TransportType) -> std::io::Result<()> {
-    use byteorder::{BigEndian, WriteBytesExt};
-    use std::io::Write;
+/// Send a response via a `BufWriter` — header and payload are coalesced into
+/// a single `flush()` call instead of multiple `write_all` syscalls.
+fn send_response_buffered<W: Write>(
+    writer: &mut W,
+    payload: &[u8],
+    transport: TransportType,
+) -> std::io::Result<()> {
+    use byteorder::WriteBytesExt;
     match transport {
         TransportType::Framed => {
-            stream.write_i32::<BigEndian>(payload.len() as i32)?;
-            stream.write_all(payload)?;
+            writer.write_i32::<BigEndian>(payload.len() as i32)?;
+            writer.write_all(payload)?;
         }
         TransportType::Buffered => {
-            stream.write_all(payload)?;
+            writer.write_all(payload)?;
         }
     }
-    stream.flush()
+    writer.flush()
 }
+
 
 /// Read a Thrift struct body (including nested structs) from a buffered reader
 /// until the outermost STOP byte (0x00) is consumed, appending all bytes
@@ -1025,7 +1208,10 @@ fn read_buffered_value<R: std::io::Read>(
             // Unknown type; we can't safely advance — return an error.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Unknown field type byte 0x{:02x} in buffered stream", field_type_byte),
+                format!(
+                    "Unknown field type byte 0x{:02x} in buffered stream",
+                    field_type_byte
+                ),
             ));
         }
     }
@@ -1054,13 +1240,15 @@ fn build_reply_body(
                 field_type: thrift_type_to_ttype(return_type),
                 id: 0,
             };
-            writer.write_field_begin(&field_begin)
+            writer
+                .write_field_begin(&field_begin)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             write_value_with_structs(&mut writer, return_type, value, struct_map)?;
         }
     }
 
-    writer.write_field_stop()
+    writer
+        .write_field_stop()
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     drop(writer);
     let _ = py;
@@ -1072,7 +1260,9 @@ fn build_reply_frame(method_name: &str, seq_id: i32, body: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(32 + body.len());
     {
         let mut writer = BinaryProtocolWriter::new(&mut buf);
-        writer.write_message_begin(method_name, MESSAGE_TYPE_REPLY, seq_id).unwrap();
+        writer
+            .write_message_begin(method_name, MESSAGE_TYPE_REPLY, seq_id)
+            .unwrap();
     }
     buf.extend_from_slice(body);
     buf
@@ -1083,12 +1273,22 @@ fn build_exception_reply(method_name: &str, seq_id: i32, ex_type: i32, message: 
     let mut buf = Vec::with_capacity(64);
     {
         let mut writer = BinaryProtocolWriter::new(&mut buf);
-        writer.write_message_begin(method_name, MESSAGE_TYPE_EXCEPTION, seq_id).unwrap();
+        writer
+            .write_message_begin(method_name, MESSAGE_TYPE_EXCEPTION, seq_id)
+            .unwrap();
         // TApplicationException struct: field 1 = message (string), field 2 = type (i32)
-        let msg_field = FieldBegin { name: None, field_type: TType::String, id: 1 };
+        let msg_field = FieldBegin {
+            name: None,
+            field_type: TType::String,
+            id: 1,
+        };
         writer.write_field_begin(&msg_field).unwrap();
         writer.write_string(message).unwrap();
-        let type_field = FieldBegin { name: None, field_type: TType::I32, id: 2 };
+        let type_field = FieldBegin {
+            name: None,
+            field_type: TType::I32,
+            id: 2,
+        };
         writer.write_field_begin(&type_field).unwrap();
         writer.write_i32(ex_type).unwrap();
         writer.write_field_stop().unwrap();
@@ -1120,8 +1320,9 @@ pub(crate) fn serialize_struct_any<W: std::io::Write>(
                         field_type: thrift_type_to_ttype(&field.field_type),
                         id: field.id,
                     };
-                    writer.write_field_begin(&field_begin)
-                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+                    writer.write_field_begin(&field_begin).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                    })?;
                     write_value_with_structs(writer, &field.field_type, bound, struct_map)?;
                 }
             } else if let Some(tv) = instance.inner.values.get(&field.name) {
@@ -1131,10 +1332,12 @@ pub(crate) fn serialize_struct_any<W: std::io::Write>(
                     field_type: thrift_type_to_ttype(&field.field_type),
                     id: field.id,
                 };
-                writer.write_field_begin(&field_begin)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
-                write_thrift_value(writer, tv, struct_map)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+                writer.write_field_begin(&field_begin).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+                write_thrift_value(writer, tv, struct_map).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
             }
             // else: field absent in both cache and inner — skip (None)
         }
@@ -1158,8 +1361,9 @@ pub(crate) fn serialize_struct_fields<W: std::io::Write>(
                 field_type: thrift_type_to_ttype(&field.field_type),
                 id: field.id,
             };
-            writer.write_field_begin(&field_begin)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e)))?;
+            writer.write_field_begin(&field_begin).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+            })?;
             write_value_with_structs(writer, &field.field_type, &value, struct_map)?;
         }
     }
@@ -1176,8 +1380,9 @@ pub(crate) fn deserialize_struct_fields<'py, R: std::io::Read>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
     loop {
-        let field_begin = reader.read_field_begin()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
+        let field_begin = reader.read_field_begin().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+        })?;
         if field_begin.field_type == TType::Stop {
             break;
         }
@@ -1186,8 +1391,9 @@ pub(crate) fn deserialize_struct_fields<'py, R: std::io::Read>(
             let value = read_value_with_structs(reader, &field.field_type, struct_map, py)?;
             result.set_item(&field.name, value)?;
         } else {
-            skip_value(reader, field_begin.field_type)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Skip error: {}", e)))?;
+            skip_value(reader, field_begin.field_type).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Skip error: {}", e))
+            })?;
         }
     }
     Ok(result)
@@ -1226,14 +1432,15 @@ pub(crate) fn read_rust_value<R: std::io::Read>(
     match thrift_type {
         ThriftType::Bool => Ok(ThriftValue::Bool(reader.read_bool()?)),
         ThriftType::Byte => Ok(ThriftValue::Byte(reader.read_byte()?)),
-        ThriftType::I16  => Ok(ThriftValue::I16(reader.read_i16()?)),
-        ThriftType::I32  => Ok(ThriftValue::I32(reader.read_i32()?)),
-        ThriftType::I64  => Ok(ThriftValue::I64(reader.read_i64()?)),
+        ThriftType::I16 => Ok(ThriftValue::I16(reader.read_i16()?)),
+        ThriftType::I32 => Ok(ThriftValue::I32(reader.read_i32()?)),
+        ThriftType::I64 => Ok(ThriftValue::I64(reader.read_i64()?)),
         ThriftType::Double => Ok(ThriftValue::Double(reader.read_double()?)),
         ThriftType::String => Ok(ThriftValue::String(reader.read_string()?)),
         ThriftType::Binary => Ok(ThriftValue::Binary(reader.read_binary()?)),
         ThriftType::List(elem_type) => {
-            let lb = reader.read_list_begin()
+            let lb = reader
+                .read_list_begin()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             let mut items = Vec::with_capacity(lb.size as usize);
             for _ in 0..lb.size {
@@ -1242,7 +1449,8 @@ pub(crate) fn read_rust_value<R: std::io::Read>(
             Ok(ThriftValue::List(items))
         }
         ThriftType::Set(elem_type) => {
-            let sb = reader.read_set_begin()
+            let sb = reader
+                .read_set_begin()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             let mut items = Vec::with_capacity(sb.size as usize);
             for _ in 0..sb.size {
@@ -1251,7 +1459,8 @@ pub(crate) fn read_rust_value<R: std::io::Read>(
             Ok(ThriftValue::Set(items))
         }
         ThriftType::Map(key_type, val_type) => {
-            let mb = reader.read_map_begin()
+            let mb = reader
+                .read_map_begin()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             let mut pairs = Vec::with_capacity(mb.size as usize);
             for _ in 0..mb.size {
@@ -1262,13 +1471,18 @@ pub(crate) fn read_rust_value<R: std::io::Read>(
             Ok(ThriftValue::Map(pairs))
         }
         ThriftType::Struct(struct_name) => {
-            let struct_def = struct_map.get(struct_name)
-                .ok_or_else(|| std::io::Error::new(
+            let struct_def = struct_map.get(struct_name).ok_or_else(|| {
+                std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("Unknown struct type: {}", struct_name),
-                ))?;
-            let fm: HashMap<i16, usize> = struct_def.fields.iter()
-                .enumerate().map(|(i, f)| (f.id, i)).collect();
+                )
+            })?;
+            let fm: HashMap<i16, usize> = struct_def
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.id, i))
+                .collect();
             let nested = deserialize_rust_struct(reader, &struct_def.fields, &fm, struct_map)?;
             Ok(ThriftValue::Struct {
                 name: Some(struct_name.clone()),
@@ -1288,12 +1502,13 @@ pub(crate) fn deserialize_rust_struct<R: std::io::Read>(
 ) -> std::io::Result<RustStructValue> {
     let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
     let mut result = RustStructValue {
-        struct_name: String::new(),   // caller sets struct_name if needed
+        struct_name: String::new(), // caller sets struct_name if needed
         field_names,
         values: HashMap::new(),
     };
     loop {
-        let field_begin = reader.read_field_begin()
+        let field_begin = reader
+            .read_field_begin()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         if field_begin.field_type == TType::Stop {
             break;
@@ -1323,16 +1538,19 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
     struct_map: &HashMap<String, ThriftStruct>,
 ) -> std::io::Result<()> {
     match val {
-        ThriftValue::Bool(v)   => writer.write_bool(*v),
-        ThriftValue::Byte(v)   => writer.write_byte(*v),
-        ThriftValue::I16(v)    => writer.write_i16(*v),
-        ThriftValue::I32(v)    => writer.write_i32(*v),
-        ThriftValue::I64(v)    => writer.write_i64(*v),
+        ThriftValue::Bool(v) => writer.write_bool(*v),
+        ThriftValue::Byte(v) => writer.write_byte(*v),
+        ThriftValue::I16(v) => writer.write_i16(*v),
+        ThriftValue::I32(v) => writer.write_i32(*v),
+        ThriftValue::I64(v) => writer.write_i64(*v),
         ThriftValue::Double(v) => writer.write_double(*v),
         ThriftValue::String(v) => writer.write_string(v),
         ThriftValue::Binary(v) => writer.write_binary(v),
         ThriftValue::List(items) => {
-            let elem_ttype = items.first().map(|v| thrift_value_ttype(v)).unwrap_or(TType::String);
+            let elem_ttype = items
+                .first()
+                .map(|v| thrift_value_ttype(v))
+                .unwrap_or(TType::String);
             writer.write_list_begin(&crate::protocol::ListBegin {
                 element_type: elem_ttype,
                 size: items.len() as i32,
@@ -1343,7 +1561,10 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
             Ok(())
         }
         ThriftValue::Set(items) => {
-            let elem_ttype = items.first().map(|v| thrift_value_ttype(v)).unwrap_or(TType::String);
+            let elem_ttype = items
+                .first()
+                .map(|v| thrift_value_ttype(v))
+                .unwrap_or(TType::String);
             writer.write_set_begin(&crate::protocol::SetBegin {
                 element_type: elem_ttype,
                 size: items.len() as i32,
@@ -1354,7 +1575,8 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
             Ok(())
         }
         ThriftValue::Map(pairs) => {
-            let (kt, vt) = pairs.first()
+            let (kt, vt) = pairs
+                .first()
                 .map(|(k, v)| (thrift_value_ttype(k), thrift_value_ttype(v)))
                 .unwrap_or((TType::String, TType::String));
             writer.write_map_begin(&crate::protocol::MapBegin {
@@ -1373,7 +1595,8 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
             // otherwise fall back to arbitrary key order.
             let ordered_fields: Vec<(&String, &ThriftValue)> = if let Some(sname) = name {
                 if let Some(def) = struct_map.get(sname) {
-                    def.fields.iter()
+                    def.fields
+                        .iter()
                         .filter_map(|fd| fields.get(&fd.name).map(|v| (&fd.name, v)))
                         .collect()
                 } else {
@@ -1392,7 +1615,11 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
                     .map(|f| f.id)
                     .unwrap_or(0);
                 let ttype = thrift_value_ttype(fval);
-                let field_begin = crate::protocol::FieldBegin { name: None, field_type: ttype, id: field_id };
+                let field_begin = crate::protocol::FieldBegin {
+                    name: None,
+                    field_type: ttype,
+                    id: field_id,
+                };
                 writer.write_field_begin(&field_begin)?;
                 write_thrift_value(writer, fval, struct_map)?;
             }
@@ -1406,17 +1633,17 @@ pub(crate) fn write_thrift_value<W: std::io::Write>(
 #[inline]
 fn thrift_value_ttype(val: &ThriftValue) -> TType {
     match val {
-        ThriftValue::Bool(_)   => TType::Bool,
-        ThriftValue::Byte(_)   => TType::Byte,
-        ThriftValue::I16(_)    => TType::I16,
-        ThriftValue::I32(_)    => TType::I32,
-        ThriftValue::I64(_)    => TType::I64,
+        ThriftValue::Bool(_) => TType::Bool,
+        ThriftValue::Byte(_) => TType::Byte,
+        ThriftValue::I16(_) => TType::I16,
+        ThriftValue::I32(_) => TType::I32,
+        ThriftValue::I64(_) => TType::I64,
         ThriftValue::Double(_) => TType::Double,
         ThriftValue::String(_) => TType::String,
         ThriftValue::Binary(_) => TType::String,
-        ThriftValue::List(_)   => TType::List,
-        ThriftValue::Set(_)    => TType::Set,
-        ThriftValue::Map(_)    => TType::Map,
+        ThriftValue::List(_) => TType::List,
+        ThriftValue::Set(_) => TType::Set,
+        ThriftValue::Map(_) => TType::Map,
         ThriftValue::Struct { .. } => TType::Struct,
     }
 }
@@ -1451,37 +1678,45 @@ fn write_value_with_structs<'py, W: std::io::Write>(
 ) -> PyResult<()> {
     match thrift_type {
         ThriftType::Bool => {
-            writer.write_bool(value.extract()?)
+            writer
+                .write_bool(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::Byte => {
-            writer.write_byte(value.extract()?)
+            writer
+                .write_byte(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::I16 => {
-            writer.write_i16(value.extract()?)
+            writer
+                .write_i16(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::I32 => {
-            writer.write_i32(value.extract()?)
+            writer
+                .write_i32(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::I64 => {
-            writer.write_i64(value.extract()?)
+            writer
+                .write_i64(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::Double => {
-            writer.write_double(value.extract()?)
+            writer
+                .write_double(value.extract()?)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::String => {
             let val: String = value.extract()?;
-            writer.write_string(&val)
+            writer
+                .write_string(&val)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::Binary => {
             let val: Vec<u8> = value.extract()?;
-            writer.write_binary(&val)
+            writer
+                .write_binary(&val)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::List(elem_type) | ThriftType::Set(elem_type) => {
@@ -1492,11 +1727,16 @@ fn write_value_with_structs<'py, W: std::io::Write>(
                 size: list.len() as i32,
             };
             if matches!(thrift_type, ThriftType::List(_)) {
-                writer.write_list_begin(&lb)
+                writer
+                    .write_list_begin(&lb)
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             } else {
                 use crate::protocol::SetBegin;
-                writer.write_set_begin(&SetBegin { element_type: lb.element_type, size: lb.size })
+                writer
+                    .write_set_begin(&SetBegin {
+                        element_type: lb.element_type,
+                        size: lb.size,
+                    })
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             }
             for item in list.iter() {
@@ -1504,15 +1744,16 @@ fn write_value_with_structs<'py, W: std::io::Write>(
             }
         }
         ThriftType::Map(key_type, val_type) => {
-            use pyo3::types::PyDict as PyDictType;
             use crate::protocol::MapBegin;
+            use pyo3::types::PyDict as PyDictType;
             let dict = value.cast::<PyDictType>()?;
             let mb = MapBegin {
                 key_type: thrift_type_to_ttype(key_type),
                 value_type: thrift_type_to_ttype(val_type),
                 size: dict.len() as i32,
             };
-            writer.write_map_begin(&mb)
+            writer
+                .write_map_begin(&mb)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             for (k, v) in dict.iter() {
                 write_value_with_structs(writer, key_type, &k, struct_map)?;
@@ -1521,12 +1762,15 @@ fn write_value_with_structs<'py, W: std::io::Write>(
         }
         ThriftType::Struct(struct_name) => {
             let struct_def = struct_map.get(struct_name).ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Unknown struct type: {}", struct_name))
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Unknown struct type: {}",
+                    struct_name
+                ))
             })?;
             let py = value.py();
             serialize_struct_any(writer, &struct_def.fields, value, struct_map, py)?;
-            writer.write_field_stop()
+            writer
+                .write_field_stop()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
     }
@@ -1542,52 +1786,67 @@ fn read_value_with_structs<'py, R: std::io::Read>(
 ) -> PyResult<Py<PyAny>> {
     match thrift_type {
         ThriftType::Bool => {
-            let val = reader.read_bool()
+            let val = reader
+                .read_bool()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().to_owned().into_any().unbind())
+            Ok(val
+                .into_pyobject(py)
+                .unwrap()
+                .to_owned()
+                .into_any()
+                .unbind())
         }
         ThriftType::Byte => {
-            let val = reader.read_byte()
+            let val = reader
+                .read_byte()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I16 => {
-            let val = reader.read_i16()
+            let val = reader
+                .read_i16()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I32 => {
-            let val = reader.read_i32()
+            let val = reader
+                .read_i32()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::I64 => {
-            let val = reader.read_i64()
+            let val = reader
+                .read_i64()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::Double => {
-            let val = reader.read_double()
+            let val = reader
+                .read_double()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::String => {
-            let val = reader.read_string()
+            let val = reader
+                .read_string()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(val.into_pyobject(py).unwrap().into_any().unbind())
         }
         ThriftType::Binary => {
-            let val = reader.read_binary()
+            let val = reader
+                .read_binary()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(PyBytes::new(py, &val).into_any().unbind())
         }
         ThriftType::List(elem_type) | ThriftType::Set(elem_type) => {
             let (_elem_ttype, size) = if matches!(thrift_type, ThriftType::List(_)) {
-                let lb = reader.read_list_begin()
+                let lb = reader
+                    .read_list_begin()
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
                 (lb.element_type, lb.size)
             } else {
-                let sb = reader.read_set_begin()
+                let sb = reader
+                    .read_set_begin()
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
                 (sb.element_type, sb.size)
             };
@@ -1600,7 +1859,8 @@ fn read_value_with_structs<'py, R: std::io::Read>(
         }
         ThriftType::Map(key_type, val_type) => {
             use pyo3::types::PyDict as PyDictType;
-            let mb = reader.read_map_begin()
+            let mb = reader
+                .read_map_begin()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             let dict = PyDictType::new(py);
             for _ in 0..mb.size {
@@ -1612,17 +1872,31 @@ fn read_value_with_structs<'py, R: std::io::Read>(
         }
         ThriftType::Struct(struct_name) => {
             let struct_def = struct_map.get(struct_name).ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Unknown struct type: {}", struct_name))
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Unknown struct type: {}",
+                    struct_name
+                ))
             })?;
-            let fm: HashMap<i16, usize> = struct_def.fields.iter()
-                .enumerate().map(|(i, f)| (f.id, i)).collect();
-            let schema: HashMap<String, ThriftField> = struct_def.fields.iter()
+            let fm: HashMap<i16, usize> = struct_def
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.id, i))
+                .collect();
+            let schema: HashMap<String, ThriftField> = struct_def
+                .fields
+                .iter()
                 .map(|f| (f.name.clone(), f.clone()))
                 .collect();
             let instance = deserialize_struct_fields_as_instance(
-                reader, &struct_def.fields, &fm, struct_map, py, struct_name,
-                schema, struct_def.struct_map.clone(),
+                reader,
+                &struct_def.fields,
+                &fm,
+                struct_map,
+                py,
+                struct_name,
+                schema,
+                struct_def.struct_map.clone(),
             )?;
             Ok(instance.into_any().unbind())
         }
@@ -1635,23 +1909,36 @@ fn skip_value<R: std::io::Read>(
     ttype: TType,
 ) -> std::io::Result<()> {
     match ttype {
-        TType::Bool | TType::Byte => { reader.read_u8_raw()?; }
-        TType::I16 => { reader.read_i16_raw()?; }
-        TType::I32 => { reader.read_i32_raw()?; }
-        TType::I64 | TType::Double => { reader.read_i64_raw()?; }
-        TType::String => { reader.read_string()?; }
-        TType::Struct => {
-            loop {
-                let ft = reader.read_u8_raw()?;
-                let ft = TType::from_u8(ft).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-                if ft == TType::Stop { break; }
-                reader.read_i16_raw()?;
-                skip_value(reader, ft)?;
-            }
+        TType::Bool | TType::Byte => {
+            reader.read_u8_raw()?;
         }
+        TType::I16 => {
+            reader.read_i16_raw()?;
+        }
+        TType::I32 => {
+            reader.read_i32_raw()?;
+        }
+        TType::I64 | TType::Double => {
+            reader.read_i64_raw()?;
+        }
+        TType::String => {
+            reader.read_string()?;
+        }
+        TType::Struct => loop {
+            let ft = reader.read_u8_raw()?;
+            let ft = TType::from_u8(ft)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            if ft == TType::Stop {
+                break;
+            }
+            reader.read_i16_raw()?;
+            skip_value(reader, ft)?;
+        },
         TType::Map => {
-            let key_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-            let val_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let key_type = TType::from_u8(reader.read_u8_raw()?)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let val_type = TType::from_u8(reader.read_u8_raw()?)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
             let size = reader.read_i32_raw()?;
             for _ in 0..size {
                 skip_value(reader, key_type)?;
@@ -1659,7 +1946,8 @@ fn skip_value<R: std::io::Read>(
             }
         }
         TType::List | TType::Set => {
-            let elem_type = TType::from_u8(reader.read_u8_raw()?).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+            let elem_type = TType::from_u8(reader.read_u8_raw()?)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
             let size = reader.read_i32_raw()?;
             for _ in 0..size {
                 skip_value(reader, elem_type)?;
@@ -1674,11 +1962,11 @@ fn skip_value<R: std::io::Read>(
 /// `ThriftStructInstance` with `inner` pre-populated and an empty cache.
 pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<Py<PyAny>> {
     match val {
-        ThriftValue::Bool(v)   => Ok(v.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
-        ThriftValue::Byte(v)   => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I16(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I32(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I64(v)    => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::Bool(v) => Ok(v.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
+        ThriftValue::Byte(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I16(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I32(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::I64(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
         ThriftValue::Double(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
         ThriftValue::String(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
         ThriftValue::Binary(v) => Ok(PyBytes::new(py, v).into_any().unbind()),
@@ -1707,7 +1995,8 @@ pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<
                 field_names: field_names.clone(),
                 values: fields.clone(),
             };
-            let instance = ThriftStructInstance::from_rust(inner, HashMap::new(), Arc::new(HashMap::new()));
+            let instance =
+                ThriftStructInstance::from_rust(inner, HashMap::new(), Arc::new(HashMap::new()));
             Ok(Bound::new(py, instance)?.into_any().unbind())
         }
     }
@@ -1718,7 +2007,9 @@ pub(crate) fn thrift_value_to_py(val: &ThriftValue, py: Python<'_>) -> PyResult<
 /// in sync.  Returns `Err` for values that cannot be represented (e.g. None).
 pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftValue> {
     if val.is_none() {
-        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("None has no ThriftValue representation"));
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "None has no ThriftValue representation",
+        ));
     }
     // bool must come before i64 because Python bool is a subclass of int.
     if let Ok(v) = val.extract::<bool>() {
@@ -1737,13 +2028,13 @@ pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftV
         return Ok(ThriftValue::Binary(v));
     }
     if let Ok(list) = val.cast::<PyList>() {
-        let items: PyResult<Vec<ThriftValue>> = list.iter()
-            .map(|i| py_any_to_thrift_value(&i))
-            .collect();
+        let items: PyResult<Vec<ThriftValue>> =
+            list.iter().map(|i| py_any_to_thrift_value(&i)).collect();
         return Ok(ThriftValue::List(items?));
     }
     if let Ok(dict) = val.cast::<PyDict>() {
-        let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict.iter()
+        let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict
+            .iter()
             .map(|(k, v)| Ok((py_any_to_thrift_value(&k)?, py_any_to_thrift_value(&v)?)))
             .collect();
         return Ok(ThriftValue::Map(pairs?));
@@ -1758,7 +2049,11 @@ pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftV
                 let bound = py_val.bind(val.py());
                 let tv_result = if has_schema {
                     if let Some(field) = inst.schema.get(name) {
-                        py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), &inst.struct_map)
+                        py_any_to_thrift_value_with_type(
+                            bound,
+                            &field.field_type.clone(),
+                            &inst.struct_map,
+                        )
                     } else {
                         py_any_to_thrift_value(bound)
                     }
@@ -1775,12 +2070,13 @@ pub(crate) fn py_any_to_thrift_value(val: &Bound<'_, PyAny>) -> PyResult<ThriftV
             fields,
         });
     }
-    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-        format!("Cannot convert Python value of type '{}' to ThriftValue",
-            val.get_type().qualname()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| "<unknown>".to_string())),
-    ))
+    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+        "Cannot convert Python value of type '{}' to ThriftValue",
+        val.get_type()
+            .qualname()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string())
+    )))
 }
 
 /// Schema-aware conversion of a Python value to the exact `ThriftValue` variant
@@ -1792,55 +2088,48 @@ pub(crate) fn py_any_to_thrift_value_with_type(
     struct_map: &Arc<HashMap<String, ThriftStruct>>,
 ) -> PyResult<ThriftValue> {
     if val.is_none() {
-        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("None has no ThriftValue representation"));
+        return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "None has no ThriftValue representation",
+        ));
     }
     match thrift_type {
-        ThriftType::Bool => {
-            Ok(ThriftValue::Bool(val.extract::<bool>()?))
-        }
-        ThriftType::Byte => {
-            Ok(ThriftValue::Byte(val.extract::<i8>()?))
-        }
+        ThriftType::Bool => Ok(ThriftValue::Bool(val.extract::<bool>()?)),
+        ThriftType::Byte => Ok(ThriftValue::Byte(val.extract::<i8>()?)),
         ThriftType::I16 => {
             // Python int can always fit in i16 if the value is in range.
             Ok(ThriftValue::I16(val.extract::<i16>()?))
         }
-        ThriftType::I32 => {
-            Ok(ThriftValue::I32(val.extract::<i32>()?))
-        }
-        ThriftType::I64 => {
-            Ok(ThriftValue::I64(val.extract::<i64>()?))
-        }
-        ThriftType::Double => {
-            Ok(ThriftValue::Double(val.extract::<f64>()?))
-        }
-        ThriftType::String => {
-            Ok(ThriftValue::String(val.extract::<String>()?))
-        }
-        ThriftType::Binary => {
-            Ok(ThriftValue::Binary(val.extract::<Vec<u8>>()?))
-        }
+        ThriftType::I32 => Ok(ThriftValue::I32(val.extract::<i32>()?)),
+        ThriftType::I64 => Ok(ThriftValue::I64(val.extract::<i64>()?)),
+        ThriftType::Double => Ok(ThriftValue::Double(val.extract::<f64>()?)),
+        ThriftType::String => Ok(ThriftValue::String(val.extract::<String>()?)),
+        ThriftType::Binary => Ok(ThriftValue::Binary(val.extract::<Vec<u8>>()?)),
         ThriftType::List(elem_type) => {
             let list = val.cast::<PyList>()?;
-            let items: PyResult<Vec<ThriftValue>> = list.iter()
+            let items: PyResult<Vec<ThriftValue>> = list
+                .iter()
                 .map(|i| py_any_to_thrift_value_with_type(&i, elem_type, struct_map))
                 .collect();
             Ok(ThriftValue::List(items?))
         }
         ThriftType::Set(elem_type) => {
             let list = val.cast::<PyList>()?;
-            let items: PyResult<Vec<ThriftValue>> = list.iter()
+            let items: PyResult<Vec<ThriftValue>> = list
+                .iter()
                 .map(|i| py_any_to_thrift_value_with_type(&i, elem_type, struct_map))
                 .collect();
             Ok(ThriftValue::Set(items?))
         }
         ThriftType::Map(key_type, val_type) => {
             let dict = val.cast::<PyDict>()?;
-            let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict.iter()
-                .map(|(k, v)| Ok((
-                    py_any_to_thrift_value_with_type(&k, key_type, struct_map)?,
-                    py_any_to_thrift_value_with_type(&v, val_type, struct_map)?,
-                )))
+            let pairs: PyResult<Vec<(ThriftValue, ThriftValue)>> = dict
+                .iter()
+                .map(|(k, v)| {
+                    Ok((
+                        py_any_to_thrift_value_with_type(&k, key_type, struct_map)?,
+                        py_any_to_thrift_value_with_type(&v, val_type, struct_map)?,
+                    ))
+                })
                 .collect();
             Ok(ThriftValue::Map(pairs?))
         }
@@ -1856,12 +2145,20 @@ pub(crate) fn py_any_to_thrift_value_with_type(
                         // Use schema from global struct_map for coercion if available.
                         let tv_result = if let Some(def) = schema {
                             if let Some(field) = def.fields.iter().find(|f| f.name == *name) {
-                                py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), struct_map)
+                                py_any_to_thrift_value_with_type(
+                                    bound,
+                                    &field.field_type.clone(),
+                                    struct_map,
+                                )
                             } else {
                                 py_any_to_thrift_value(bound)
                             }
                         } else if let Some(field) = inst.schema.get(name) {
-                            py_any_to_thrift_value_with_type(bound, &field.field_type.clone(), &inst.struct_map)
+                            py_any_to_thrift_value_with_type(
+                                bound,
+                                &field.field_type.clone(),
+                                &inst.struct_map,
+                            )
                         } else {
                             py_any_to_thrift_value(bound)
                         };
@@ -1882,11 +2179,17 @@ pub(crate) fn py_any_to_thrift_value_with_type(
                     let field_name: String = k.extract()?;
                     let tv = if let Some(def) = schema_def {
                         if let Some(field) = def.fields.iter().find(|f| f.name == field_name) {
-                            py_any_to_thrift_value_with_type(&v, &field.field_type.clone(), struct_map)
-                                .unwrap_or_else(|_| py_any_to_thrift_value(&v).unwrap_or(ThriftValue::String(String::new())))
+                            py_any_to_thrift_value_with_type(
+                                &v,
+                                &field.field_type.clone(),
+                                struct_map,
+                            )
+                            .unwrap_or_else(|_| {
+                                py_any_to_thrift_value(&v)
+                                    .unwrap_or(ThriftValue::String(String::new()))
+                            })
                         } else {
-                            py_any_to_thrift_value(&v)
-                                .unwrap_or(ThriftValue::String(String::new()))
+                            py_any_to_thrift_value(&v).unwrap_or(ThriftValue::String(String::new()))
                         }
                     } else {
                         py_any_to_thrift_value(&v)?
@@ -1905,4 +2208,448 @@ pub(crate) fn py_any_to_thrift_value_with_type(
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// ThriftApplicationException
+// Raised by ThriftClient.call() when the server returns MESSAGE_TYPE_EXCEPTION.
+// ──────────────────────────────────────────────────────────────────────────────
 
+/// A Thrift application-level exception returned by the remote server.
+///
+/// Attributes
+/// ----------
+/// message : str
+///     Human-readable error message sent by the server.
+/// type_ : int
+///     TApplicationException type code (1 = UNKNOWN, 6 = INTERNAL_ERROR, …).
+#[pyclass(extends = pyo3::exceptions::PyException)]
+#[derive(Debug)]
+pub struct ThriftApplicationException {
+    #[pyo3(get)]
+    pub message: String,
+    #[pyo3(get)]
+    pub type_: i32,
+}
+
+#[pymethods]
+impl ThriftApplicationException {
+    #[new]
+    pub fn new(message: String, type_: i32) -> Self {
+        ThriftApplicationException {
+            message: message.clone(),
+            type_,
+        }
+    }
+
+    pub fn __repr__(&self) -> String {
+        format!(
+            "ThriftApplicationException(type={}, message={:?})",
+            self.type_, self.message
+        )
+    }
+
+    pub fn __str__(&self) -> String {
+        self.message.clone()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// ThriftClient
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A synchronous Thrift Binary Protocol client.
+///
+/// The socket I/O is performed **outside** the GIL so other Python threads can
+/// run while a call is in-flight.  A `Mutex` guards the single `TcpStream` so
+/// the client can safely be used from multiple Python threads (calls are
+/// serialised at the socket level).
+///
+/// Usage::
+///
+///     client = ThriftClient(service_def, "127.0.0.1", 9090,
+///                           TransportType.Buffered)
+///     client.set_parser(thrift_module._parser)
+///     client.open()
+///     result = client.call("get_user", user_id=1)
+///     client.close()
+///
+/// Or as a context manager::
+///
+///     with ThriftClient(service_def, "127.0.0.1", 9090) as client:
+///         result = client.call("get_user", user_id=1)
+#[pyclass]
+pub struct ThriftClient {
+    service: PyThriftService,
+    struct_map: Arc<HashMap<String, ThriftStruct>>,
+    transport: TransportType,
+    host: String,
+    port: u16,
+    /// The live TCP connection — `None` until `open()` is called.
+    socket: Mutex<Option<TcpStream>>,
+    /// Monotonically-increasing sequence-id counter.
+    seq_id: AtomicI32,
+}
+
+#[pymethods]
+impl ThriftClient {
+    #[new]
+    #[pyo3(signature = (service, host, port, transport = TransportType::Framed))]
+    pub fn new(
+        service: PyThriftService,
+        host: String,
+        port: u16,
+        transport: TransportType,
+    ) -> Self {
+        Self {
+            service,
+            struct_map: Arc::new(HashMap::new()),
+            transport,
+            host,
+            port,
+            socket: Mutex::new(None),
+            seq_id: AtomicI32::new(0),
+        }
+    }
+
+    /// Attach the parser so nested struct types can be resolved during
+    /// argument serialisation and return-value deserialisation.
+    pub fn set_parser(&mut self, parser: &ThriftParser) {
+        self.struct_map = parser.struct_map();
+    }
+
+    /// Open the TCP connection to the remote server.
+    /// Releases the GIL while the OS is establishing the connection.
+    pub fn open(&self, py: Python<'_>) -> PyResult<()> {
+        let addr = format!("{}:{}", self.host, self.port);
+        let stream = py.detach(|| TcpStream::connect(&addr)).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("connect to {}: {}", addr, e))
+        })?;
+        // Disable Nagle's algorithm for low-latency request/response.
+        let _ = stream.set_nodelay(true);
+        let mut guard = self.socket.lock().unwrap();
+        *guard = Some(stream);
+        Ok(())
+    }
+
+    /// Close the TCP connection.
+    pub fn close(&self) {
+        let mut guard = self.socket.lock().unwrap();
+        *guard = None; // Drop closes the TcpStream.
+    }
+
+    /// Returns `True` if the socket is currently open.
+    pub fn is_open(&self) -> bool {
+        self.socket.lock().unwrap().is_some()
+    }
+
+    // ── Context-manager support ──────────────────────────────────────────────
+
+    pub fn __enter__<'a>(slf: PyRef<'a, Self>, py: Python<'a>) -> PyResult<PyRef<'a, Self>> {
+        slf.open(py)?;
+        Ok(slf)
+    }
+
+    pub fn __exit__(
+        &self,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) {
+        self.close();
+    }
+
+    // ── Transport getter/setter (mirrors ThriftServer) ───────────────────────
+
+    #[getter]
+    pub fn transport(&self) -> TransportType {
+        self.transport
+    }
+
+    #[setter]
+    pub fn set_transport(&mut self, transport: TransportType) {
+        self.transport = transport;
+    }
+
+    /// Invoke a remote method.
+    ///
+    /// Parameters
+    /// ----------
+    /// method_name : str
+    ///     Name of the service method to call.
+    /// **kwargs
+    ///     Keyword arguments matching the method's argument names.
+    ///
+    /// Returns
+    /// -------
+    /// The deserialised return value, or ``None`` for ``void`` methods.
+    ///
+    /// Raises
+    /// ------
+    /// ThriftApplicationException
+    ///     If the server replies with a Thrift application-exception.
+    /// OSError
+    ///     If the socket is not open or the network call fails.
+    #[pyo3(signature = (method_name, **kwargs))]
+    pub fn call(
+        &self,
+        py: Python<'_>,
+        method_name: &str,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        // ── Find the method definition ────────────────────────────────────────
+        let method = self
+            .service
+            .methods
+            .iter()
+            .find(|m| m.name == method_name)
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Unknown method: {}",
+                    method_name
+                ))
+            })?
+            .clone();
+
+        let seq_id = self.seq_id.fetch_add(1, Ordering::Relaxed);
+
+        // ── Serialise the call frame (GIL held — pure in-memory work) ─────────
+        let call_frame: Vec<u8> = {
+            let empty_dict;
+            let kw: &Bound<'_, PyDict> = if let Some(k) = kwargs {
+                k
+            } else {
+                empty_dict = PyDict::new(py);
+                &empty_dict
+            };
+
+            // Build the message header.
+            let mut buf = Vec::with_capacity(256);
+            {
+                let mut writer = BinaryProtocolWriter::new(&mut buf);
+                writer
+                    .write_message_begin(method_name, MESSAGE_TYPE_CALL, seq_id)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            }
+
+            // Serialise each argument field in definition order.
+            {
+                let mut writer = BinaryProtocolWriter::new(&mut buf);
+                for field in &method.arguments {
+                    // Fetch the value from kwargs by field name, skip if absent.
+                    let value = match kw.get_item(&field.name)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    // Write field header.
+                    let fb = FieldBegin {
+                        name: None,
+                        field_type: thrift_type_to_ttype(&field.field_type),
+                        id: field.id,
+                    };
+                    writer
+                        .write_field_begin(&fb)
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                    write_value_with_structs(
+                        &mut writer,
+                        &field.field_type,
+                        &value,
+                        &self.struct_map,
+                    )?;
+                }
+                writer
+                    .write_field_stop()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            }
+
+            buf
+        };
+
+        // ── Capture return type and struct_map before releasing the GIL ───────
+        let return_type = method.return_type.clone();
+        let struct_map = Arc::clone(&self.struct_map);
+        let transport = self.transport;
+
+        // ── Network round-trip — GIL released ────────────────────────────────
+        let reply_payload: Vec<u8> = py
+            .detach(|| -> Result<Vec<u8>, String> {
+                let mut guard = self.socket.lock().unwrap();
+                let stream = guard.as_mut().ok_or_else(|| {
+                    "ThriftClient is not open; call client.open() first".to_string()
+                })?;
+
+                // Send the call frame.
+                client_send_frame(stream, &call_frame, transport)
+                    .map_err(|e| format!("send error: {}", e))?;
+
+                // Receive the reply frame.
+                client_recv_frame(stream, transport).map_err(|e| format!("recv error: {}", e))
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e))?;
+
+        // ── Deserialise reply (GIL held again) ────────────────────────────────
+        let mut cursor = Cursor::new(&reply_payload[..]);
+        let mut reader = BinaryProtocolReader::new(&mut cursor);
+
+        let msg_begin = reader
+            .read_message_begin()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+
+        if msg_begin.message_type == MESSAGE_TYPE_EXCEPTION {
+            // Deserialise TApplicationException: field 1 = message (string),
+            // field 2 = type (i32).
+            let (ex_msg, ex_type) = read_application_exception(&mut reader)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            // Raise as ThriftApplicationException.
+            return Err(PyErr::new::<ThriftApplicationException, _>((
+                ex_msg, ex_type,
+            )));
+        }
+
+        // MESSAGE_TYPE_REPLY — field 0 = success, field N = declared exception.
+        // Read the single reply field.
+        let field_begin = reader
+            .read_field_begin()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+
+        if field_begin.field_type == TType::Stop {
+            // void method or empty reply.
+            return Ok(py.None());
+        }
+
+        if field_begin.id != 0 {
+            // Non-zero field id in a reply means a declared service exception.
+            // Read and deserialise it as a struct, then raise as a Python RuntimeError.
+            // (Declared exceptions could be raised as proper typed exceptions in future.)
+            let ex_val = read_rust_value(&mut reader, &return_type, &struct_map)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()));
+            let ex_py = match ex_val {
+                Ok(tv) => thrift_value_to_py(&tv, py)?,
+                Err(_) => py.None(),
+            };
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Service exception (field {}): {:?}",
+                field_begin.id,
+                ex_py
+                    .bind(py)
+                    .repr()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            )));
+        }
+
+        // Field 0 = success result.
+        let rust_val = read_rust_value(&mut reader, &return_type, &struct_map)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        thrift_value_to_py(&rust_val, py)
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Client I/O helpers  (GIL-free, no Python types)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Send a call frame over the socket, respecting the chosen transport framing.
+/// Uses a `BufWriter` to coalesce the length header and payload into a single
+/// `flush()` call instead of two separate `write_all` syscalls.
+fn client_send_frame(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    transport: TransportType,
+) -> std::io::Result<()> {
+    use byteorder::WriteBytesExt;
+    let mut w: BufWriter<&mut TcpStream> = BufWriter::with_capacity(payload.len() + 4, stream);
+    match transport {
+        TransportType::Framed => {
+            w.write_i32::<BigEndian>(payload.len() as i32)?;
+            w.write_all(payload)?;
+        }
+        TransportType::Buffered => {
+            w.write_all(payload)?;
+        }
+    }
+    w.flush()
+}
+
+/// Receive a reply frame from the socket, reassembling it into a single
+/// contiguous buffer (mirrors the server-side read logic).
+fn client_recv_frame(stream: &mut TcpStream, transport: TransportType) -> std::io::Result<Vec<u8>> {
+    use byteorder::ReadBytesExt;
+    use std::io::Read;
+
+    match transport {
+        TransportType::Framed => {
+            let frame_len = match stream.read_i32::<BigEndian>() {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(_) => return Ok(vec![]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(vec![]),
+                Err(e) => return Err(e),
+            };
+            let mut buf = vec![0u8; frame_len];
+            stream.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+        TransportType::Buffered => {
+            // Wrap in BufReader for efficient byte-at-a-time reads.
+            let mut r: BufReader<&mut TcpStream> = BufReader::with_capacity(65536, stream);
+
+            // 1. Version + type (4 bytes)
+            let mut hdr = [0u8; 4];
+            r.read_exact(&mut hdr)?;
+
+            // 2. Name length + name + seq_id
+            let mut name_len_bytes = [0u8; 4];
+            r.read_exact(&mut name_len_bytes)?;
+            let name_len = i32::from_be_bytes(name_len_bytes) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            r.read_exact(&mut name_buf)?;
+            let mut seq_id_bytes = [0u8; 4];
+            r.read_exact(&mut seq_id_bytes)?;
+
+            // 3. Struct body up to the outermost STOP byte.
+            let mut body: Vec<u8> = Vec::with_capacity(256);
+            read_buffered_struct_body(&mut r, &mut body)?;
+
+            // 4. Reassemble.
+            let mut frame = Vec::with_capacity(4 + 4 + name_len + 4 + body.len());
+            frame.extend_from_slice(&hdr);
+            frame.extend_from_slice(&name_len_bytes);
+            frame.extend_from_slice(&name_buf);
+            frame.extend_from_slice(&seq_id_bytes);
+            frame.extend_from_slice(&body);
+            Ok(frame)
+        }
+    }
+}
+
+/// Deserialise the two fields of a `TApplicationException` struct from the wire.
+/// Returns `(message, type_code)`.
+fn read_application_exception<R: std::io::Read>(
+    reader: &mut BinaryProtocolReader<R>,
+) -> std::io::Result<(String, i32)> {
+    use byteorder::ReadBytesExt;
+    let mut msg = String::new();
+    let mut type_code: i32 = 0;
+    loop {
+        let ft = reader.read_u8_raw()?;
+        let ttype = TType::from_u8(ft)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
+        if ttype == TType::Stop {
+            break;
+        }
+        let id = reader.read_i16_raw()?;
+        match (ttype, id) {
+            (TType::String, 1) => {
+                msg = reader.read_string()?;
+            }
+            (TType::I32, 2) => {
+                type_code = reader.read_i32_raw()?;
+            }
+            _ => {
+                // Skip unknown field.
+                skip_value(reader, ttype).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+            }
+        }
+    }
+    Ok((msg, type_code))
+}

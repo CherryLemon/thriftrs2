@@ -38,6 +38,8 @@ import threading
 import statistics
 from collections import defaultdict
 
+# from tqdm import trange
+trange = range
 # ── make local python package importable ──────────────────────────────────────
 EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(EXAMPLES_DIR, '..', 'python'))
@@ -55,7 +57,7 @@ except ImportError:
     print("[WARN] thriftpy2 not found")
 
 try:
-    from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport
+    from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport, make_client as rs_make_client, make_server as rs_make_server
     HAS_RS = True
 except ImportError:
     HAS_RS = False
@@ -78,77 +80,16 @@ def _wait_port(host: str, port: int, timeout: float = 10.0) -> None:
     raise RuntimeError(f"Server {host}:{port} did not come up within {timeout}s")
 
 
-def start_rs_server(host: str, port: int) -> None:
-    """Start the thrift_rs_pyo3 server in a background OS thread (serve_nonblocking)."""
-    if not HAS_RS:
-        raise RuntimeError("thrift_rs_pyo3 is not importable")
-
-    mod = rs_load(THRIFT_FILE)
-    service_def = mod._parser.get_service("UserService")
-
-    # Populate with 1000 random users up-front. After population we avoid
-    # taking locks for list_users to measure a lock-free read workload.
-    _db: dict = {}
-    _next_id = [1001]
-
-    def _rand_str_local(n: int = 8) -> str:
-        return ''.join(random.choices(string.ascii_lowercase, k=n))
-
-    for i in range(1, 1001):
-        _db[i] = mod.User(**{
-            "id": i,
-            "name": f"user{ i }",
-            "email": f"{_rand_str_local(6)}{i}@example.com",
-            "age": random.randint(18, 80),
-        })
-
-    # Handlers: keep get/create for compatibility but do not lock for list
-    def handle_get_user(user_id: int):
-        return _db.get(user_id)
-
-    def handle_create_user(user: dict) -> bool:
-        uid = user.get("id", _next_id[0])
-        if uid in _db:
-            return False
-        _db[uid] = user
-        _next_id[0] = max(_next_id[0], uid + 1)
-        return True
-
-    def handle_list_users() -> list:
-        # Return a snapshot list without taking locks (read-only workload)
-        return list(_db.values())
-
-    server = ThriftServer(service_def, TBufferedTransport.transport_type)
-    server.set_parser(mod._parser)
-    server.register_handler("get_user",    handle_get_user)
-    server.register_handler("create_user", handle_create_user)
-    server.register_handler("list_users",  handle_list_users)
-
-    # serve_nonblocking starts its own OS thread and returns immediately
-    server.serve_nonblocking(host, port)
-    _wait_port(host, port)
-    print(f"[rs   ] server ready on {host}:{port}")
-
-
-def start_tp2_server(host: str, port: int) -> None:
-    """Start the thriftpy2 server in a daemon thread."""
-    if not HAS_THRIFTPY2:
-        raise RuntimeError("thriftpy2 is not importable")
-
-    thrift_mod = thriftpy2.load(THRIFT_FILE, module_name='bench_tp2_thrift')
-
+def init(thrift_mod):
     # Populate with 1000 random thrift_mod.User objects.
     _db: dict = {}
     _next_id = [1001]
 
-    def _rand_str_local(n: int = 8) -> str:
-        return ''.join(random.choices(string.ascii_lowercase, k=n))
-
-    for i in range(1, 1001):
+    for i in range(1, 101):
         _db[i] = thrift_mod.User(
             id=i,
-            name=f"user{i}",
-            email=f"{_rand_str_local(6)}{i}@example.com",
+            name=f"{_rand_str()}",
+            email=f"{_rand_str(8)}@example.com",
             age=random.randint(18, 80),
         )
 
@@ -169,9 +110,36 @@ def start_tp2_server(host: str, port: int) -> None:
             # Return snapshot without locking for the read-only benchmark
             return list(_db.values())
 
+    return Handler()
+
+
+def start_rs_server(host: str, port: int) -> None:
+    """Start the thrift_rs_pyo3 server in a background OS thread (serve_nonblocking)."""
+    if not HAS_RS:
+        raise RuntimeError("thrift_rs_pyo3 is not importable")
+
+    thrift_mod = rs_load(THRIFT_FILE)
+    server = rs_make_server(
+        thrift_mod.UserService,
+        init(thrift_mod),
+        host=host,
+        port=port,
+    )
+
+    _wait_port(host, port)
+    print(f"[rs   ] server ready on {host}:{port}")
+
+
+def start_tp2_server(host: str, port: int) -> None:
+    """Start the thriftpy2 server in a daemon thread."""
+    if not HAS_THRIFTPY2:
+        raise RuntimeError("thriftpy2 is not importable")
+
+    thrift_mod = thriftpy2.load(THRIFT_FILE, module_name='bench_tp2_thrift')
+
     server = tp2_make_server(
         thrift_mod.UserService,
-        Handler(),
+        init(thrift_mod),
         host=host,
         port=port,
         trans_factory=TCyBufferedTransportFactory(),
@@ -184,8 +152,20 @@ def start_tp2_server(host: str, port: int) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Client factory  (always thriftpy2 – measures server not client overhead)
+#  Client factories
 # ══════════════════════════════════════════════════════════════════════════════
+
+def make_rs_client(host: str, port: int):
+    """Create a connected thrift_rs_pyo3 ThriftClient."""
+    mod = rs_load(THRIFT_FILE)
+    client = rs_make_client(
+        mod.UserService,
+        host,
+        port,
+        TBufferedTransport.transport_type,
+    )
+    return client, mod
+
 
 def make_tp2_client(host: str, port: int):
     """Create a fresh thriftpy2 client connection."""
@@ -214,9 +194,13 @@ def _bench_worker(
     results: list,        # append list-of-(op, latency_s)
     errors: list,         # append error strings
     barrier: threading.Barrier,
+    use_rs: bool = False,
 ) -> None:
     try:
-        client, thrift_mod = make_tp2_client(host, port)
+        if use_rs:
+            client, thrift_mod = make_rs_client(host, port)
+        else:
+            client, thrift_mod = make_tp2_client(host, port)
     except Exception as exc:
         errors.append(f"connect error: {exc}")
         barrier.wait()
@@ -225,28 +209,49 @@ def _bench_worker(
     local_latencies = []
     local_errors    = []
 
-    for _ in range(n_requests):
-        op = random.choice(ops_mix)
-        try:
-            t0 = time.perf_counter()
-            if op == 'get':
-                uid = random.randint(1, 5)
-                client.get_user(uid)
-            elif op == 'list':
-                client.list_users()
-            elif op == 'create':
-                uid = random.randint(1000, 99999)
-                user = thrift_mod.User(
-                    id=uid,
-                    name=_rand_str(),
-                    email=f"{_rand_str()}@test.com",
-                    age=random.randint(18, 80),
-                )
-                client.create_user(user)
-            elapsed = time.perf_counter() - t0
-            local_latencies.append((op, elapsed))
-        except Exception as exc:
-            local_errors.append(f"{op}: {exc}")
+    try:
+        for _ in trange(n_requests):
+            op = random.choice(ops_mix)
+            try:
+                t0 = time.perf_counter()
+                if use_rs:
+                    if op == 'get':
+                        uid = random.randint(1, 5)
+                        client.call("get_user", user_id=uid)
+                    elif op == 'list':
+                        client.call("list_users")
+                    elif op == 'create':
+                        uid = random.randint(1000, 99999)
+                        user = thrift_mod.User(**{
+                            "id": uid,
+                            "name": _rand_str(),
+                            "email": f"{_rand_str(1024)}@test.com",
+                            "age": random.randint(18, 80),
+                        })
+                        client.call("create_user", user=user)
+                else:
+                    if op == 'get':
+                        uid = random.randint(1, 5)
+                        client.get_user(uid)
+                    elif op == 'list':
+                        client.list_users()
+                    elif op == 'create':
+                        uid = random.randint(1000, 99999)
+                        user = thrift_mod.User(
+                            id=uid,
+                            name=_rand_str(),
+                            email=f"{_rand_str(1024)}@test.com",
+                            age=random.randint(18, 80),
+                        )
+                        client.create_user(user)
+                elapsed = time.perf_counter() - t0
+                local_latencies.append((op, elapsed))
+            except Exception as exc:
+                print(exc)
+                local_errors.append(f"{op}: {exc}")
+    finally:
+        if use_rs:
+            client.close()
 
     results.append(local_latencies)
     errors.extend(local_errors)
@@ -272,6 +277,7 @@ def _run_bench(
     ops_mix: list,
     requests_per_thread: int,
     concurrency: int,
+    use_rs: bool = False,
 ) -> tuple:
     """
     Spawn `concurrency` threads, each making `requests_per_thread` calls.
@@ -287,6 +293,7 @@ def _run_bench(
             target=_bench_worker,
             args=(host, port, ops_mix, requests_per_thread,
                   all_latencies, all_errors, barrier),
+            kwargs={"use_rs": use_rs},
             daemon=True,
         )
         for _ in range(concurrency)
@@ -417,9 +424,9 @@ def main() -> None:
         description='Concurrent Thrift RPC server benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-n', '--requests',    type=int, default=2000,
+    ap.add_argument('-n', '--requests',    type=int, default=1000,
                     help='Total requests per server (default: 2000)')
-    ap.add_argument('-c', '--concurrency', type=int, default=30,
+    ap.add_argument('-c', '--concurrency', type=int, default=5,
                     help='Concurrent client threads (default: 20)')
     ap.add_argument('--warmup',            type=int, default=200,
                     help='Warmup requests per server (default: 200)')
@@ -483,7 +490,7 @@ def main() -> None:
     print('\nWarming up...')
     if rs_ok:
         try:
-            _run_bench(host, rs_port, ops_mix, wpt, wc)
+            _run_bench(host, rs_port, ops_mix, wpt, wc, use_rs=False)
             print('  [rs   ] warmup done')
         except Exception as exc:
             print(f'  [rs   ] warmup error: {exc}')
@@ -502,12 +509,12 @@ def main() -> None:
 
     if rs_ok:
         print(f'\n  → thrift_rs_pyo3 ({host}:{rs_port}) …')
-        lats, errs, wall = _run_bench(host, rs_port, ops_mix, rpt, args.concurrency)
+        lats, errs, wall = _run_bench(host, rs_port, ops_mix, rpt, args.concurrency, use_rs=True)
         rs_stats = _report('thrift_rs_pyo3', lats, errs, wall)
 
     if tp2_ok:
         print(f'\n  → thriftpy2       ({host}:{tp2_port}) …')
-        lats, errs, wall = _run_bench(host, tp2_port, ops_mix, rpt, args.concurrency)
+        lats, errs, wall = _run_bench(host, tp2_port, ops_mix, rpt, args.concurrency, use_rs=False)
         tp2_stats = _report('thriftpy2', lats, errs, wall)
 
     if rs_ok and tp2_ok:
