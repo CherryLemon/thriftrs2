@@ -1,4 +1,6 @@
+import asyncio
 import os
+import threading
 from typing import Dict, Any, Optional, Union
 from .thrift_rs_pyo3 import ThriftParser, PyThriftService, ThriftClient, ThriftServer, TransportType
 
@@ -117,15 +119,50 @@ def make_client(
     return client
 
 
+class ThriftServerWrapper:
+    def __init__(self, service: ThriftService, handler, transport: TransportType, workers: int = 1):
+        server = self._server = ThriftServer(service.service_def, transport, workers)
+        self._server.set_parser(service.parser)
+        # Accept either a plain dict or an object with handler methods.
+        if isinstance(handler, dict):
+            for method_name, func in handler.items():
+                server.register_handler(method_name, func)
+        else:
+            for attr_name in dir(handler):
+                if service.service_def.get_method(attr_name) is None:
+                    continue  # skip non-service methods
+                func = getattr(handler, attr_name)
+                server.register_handler(attr_name, func)
+
+        self._loop = asyncio.new_event_loop()
+        self._th = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._th.start()
+        self._waiter = None
+
+    def serve_forever(self, host, port, blocking=True):
+        async def serve():
+            self._server.serve(host, port)
+            # ping the host + port to ensure the server is up before returning
+            while not self._server.is_running():
+                await asyncio.sleep(0.1)
+            print('server started and listening on {}:{}'.format(host, port))
+
+        async def wait():
+            while self._server.is_running():
+                await asyncio.sleep(1)
+
+        asyncio.run_coroutine_threadsafe(serve(), self._loop).result()
+        self._waiter = asyncio.run_coroutine_threadsafe(wait(), self._loop)
+        if blocking:
+            self._waiter.result()
+
 def make_server(
         service: ThriftService,
         handler: Any,
-        host: str = "127.0.0.1",
-        port: int = 9090,
         transport: TransportType = TransportType.Buffered,
         *,
         workers: int = 1
-) -> ThriftServer:
+) -> ThriftServerWrapper:
     """
     Create a :class:`ThriftServer`, register *handler* methods, and start
     serving.
@@ -138,7 +175,7 @@ def make_server(
 
     Parameters
     ----------
-    service : ThriftModule or PyThriftService
+    service : ThriftService
         Either the :class:`ThriftModule` returned by :func:`load` (recommended),
         or a raw ``PyThriftService`` obtained from
         ``thrift_module._parser.get_service("ServiceName")``.
@@ -157,24 +194,9 @@ def make_server(
 
     Returns
     -------
-    ThriftServer
+    ThriftServerWrapper
         The server is already serving (this call blocks until the server
         is stopped).
     """
-    server = ThriftServer(service.service_def, transport, workers)
-    server.set_parser(service.parser)
-
-    # Accept either a plain dict or an object with handler methods.
-    if isinstance(handler, dict):
-        for method_name, func in handler.items():
-            server.register_handler(method_name, func)
-    else:
-        for attr_name in dir(handler):
-            if attr_name.startswith("_"):
-                continue
-            func = getattr(handler, attr_name)
-            if callable(func):
-                server.register_handler(attr_name, func)
-
-    server.serve_nonblocking(host, port)
+    server = ThriftServerWrapper(service, handler, transport, workers)
     return server
