@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thrift server example using thrift_rs_pyo3.
+Thrift server example using thriftpy2.
 
 This example starts a UserService server that handles:
   - get_user(user_id)  -> User
@@ -14,11 +14,9 @@ Then test it from another terminal (or run client_example.py).
 """
 
 import os
-import sys
 import time
 import threading
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 import thriftpy2
 from thriftpy2.transport import TCyBufferedTransportFactory

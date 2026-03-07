@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
-from thrift_rs_pyo3 import load, serialize, deserialize
+from thriftrs2 import load, serialize, deserialize
+
+
+THRIFT_FILE = os.path.join(os.path.dirname(__file__), 'example.thrift')
 
 def main():
     # Load thrift file
-    thrift_module = load('example.thrift')
+    thrift_module = load(THRIFT_FILE)
 
     print("Loaded structs:", thrift_module._parser.list_structs())
 

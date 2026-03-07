@@ -12,7 +12,7 @@ use python::types::{
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn thrift_rs_pyo3(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn thriftrs2(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ThriftParser>()?;
     m.add_class::<BinaryProtocol>()?;
     m.add_class::<ThriftStruct>()?;

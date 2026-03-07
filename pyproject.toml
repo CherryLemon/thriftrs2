@@ -3,18 +3,48 @@ requires = ["maturin>=1.8,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "thrift_rs_pyo3"
-requires-python = ">=3.8"
+name = "thriftrs2"
+description = "Fast Apache Thrift bindings for Python powered by Rust and PyO3."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["thrift", "apache-thrift", "rpc", "serialization", "pyo3"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/CherryLemon/thriftrs2"
+Repository = "https://github.com/CherryLemon/thriftrs2"
+Issues = "https://github.com/CherryLemon/thriftrs2/issues"
+
 [project.optional-dependencies]
 tests = [
     "pytest",
+    "thriftpy2",
 ]
+dev = [
+    "maturin>=1.8,<2.0",
+    "pytest",
+    "thriftpy2",
+    "twine",
+]
+
 [tool.maturin]
 python-source = "python"
+module-name = "thriftrs2.thriftrs2"
 features = ["pyo3/extension-module"]

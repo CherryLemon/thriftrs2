@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thrift client example using thrift_rs_pyo3.
+Thrift client example using thriftrs2.
 
 Connects to the UserService server started by server_example.py and makes
 a few RPC calls to demonstrate the ThriftClient API.
@@ -12,11 +12,8 @@ Then run this script:
     python examples/client_example.py
 """
 import os
-import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
-from thrift_rs_pyo3 import load, make_client, TBufferedTransport, ThriftApplicationException
+from thriftrs2 import load, make_client, TBufferedTransport, ThriftApplicationException
 
 THRIFT_FILE = os.path.join(os.path.dirname(__file__), "example.thrift")
 

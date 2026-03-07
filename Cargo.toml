@@ -1,11 +1,17 @@
 [package]
-name = "thrift_rs_pyo3"
+name = "thriftrs2"
 version = "0.1.0"
 edition = "2021"
+description = "Fast Apache Thrift bindings for Python powered by Rust and PyO3."
+readme = "README.md"
+repository = "https://github.com/CherryLemon/thriftrs2"
+homepage = "https://github.com/CherryLemon/thriftrs2"
+keywords = ["thrift", "rpc", "serialization", "python", "pyo3"]
+categories = ["api-bindings", "network-programming"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "thrift_rs_pyo3"
+name = "thriftrs2"
 crate-type = ["cdylib"]
 
 [dependencies]

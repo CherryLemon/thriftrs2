@@ -351,7 +351,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thrift_rs_pyo3"
+name = "thriftrs2"
 version = "0.1.0"
 dependencies = [
  "base64",

@@ -9,14 +9,12 @@ If --image is omitted the client will send empty bytes to the server.
 """
 
 import os
-import sys
 import argparse
 import json
 import traceback
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
-from thrift_rs_pyo3 import (
+from thriftrs2 import (
     load,
     make_client,
     TBufferedTransport,

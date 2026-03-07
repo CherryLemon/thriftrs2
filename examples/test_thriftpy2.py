@@ -1,9 +1,13 @@
 import thriftpy2
 from thriftpy2.utils import deserialize, serialize
+from pathlib import Path
+
+
+THRIFT_FILE = Path(__file__).resolve().with_name('example.thrift')
 
 
 def main():
-    mod = thriftpy2.load('example.thrift', module_name='example_thrift')
+    mod = thriftpy2.load(str(THRIFT_FILE), module_name='example_thrift')
     # Create user data
     user_data = {
         'id': 123,

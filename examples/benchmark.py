@@ -8,13 +8,10 @@ Usage: python3 examples/benchmark.py
 
 The script runs multiple iterations and prints ops/sec and average time per op.
 """
-import sys
 import os
 import time
 import argparse
 
-# Ensure local python package is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 # Import thriftpy2 path (we assume thriftpy2 is installed in the environment)
 try:
@@ -24,7 +21,7 @@ except Exception:
     thriftpy2 = None
 
 # Import local bindings
-from thrift_rs_pyo3 import load as rs_load, serialize as rs_serialize, deserialize as rs_deserialize
+from thriftrs2 import load as rs_load, serialize as rs_serialize, deserialize as rs_deserialize
 
 THRIFT_FILE = os.path.join(os.path.dirname(__file__), 'example.thrift')
 
@@ -141,7 +138,7 @@ def main():
     rs_res = bench_rs_binding(args.iterations)
 
     pretty_report('thriftpy2', tp2_res, args.iterations)
-    pretty_report('thrift_rs_pyo3', rs_res, args.iterations)
+    pretty_report('thriftrs2', rs_res, args.iterations)
 
     if tp2_res is not None and rs_res is not None:
         print('\nSummary:')
@@ -149,7 +146,7 @@ def main():
             t_tp2 = tp2_res[f'{op}_total']
             t_rs = rs_res[f'{op}_total']
             ratio = t_tp2 / t_rs if t_rs > 0 else float('inf')
-            faster = 'thriftpy2' if ratio < 1 else 'thrift_rs_pyo3'
+            faster = 'thriftpy2' if ratio < 1 else 'thriftrs2'
             print(f"{op}: {faster} is {ratio:.2f}x faster (tp2: {t_tp2:.6f}s, rs: {t_rs:.6f}s)")
 
 

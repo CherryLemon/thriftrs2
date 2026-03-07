@@ -3,7 +3,7 @@
 Concurrent RPC server benchmark.
 
 Starts two Thrift UserService servers on different ports:
-  - Port 9191: thrift_rs_pyo3 (Rust-backed)
+  - Port 9191: thriftrs2 (Rust-backed)
   - Port 9192: thriftpy2 (pure-Python)
 
 Both servers implement the same UserService from example.thrift.
@@ -22,7 +22,7 @@ Options:
     -c, --concurrency Number of concurrent threads (default: 20)
     --warmup          Warmup requests per server (default: 200)
     --mix             Op mix, e.g. "get:5,list:3,create:2" (default: get:5,list:3,create:2)
-    --rs-port         Port for thrift_rs_pyo3 server (default: 9191)
+    --rs-port         Port for thriftrs2 server (default: 9191)
     --tp2-port        Port for thriftpy2 server (default: 9192)
     --host            Bind/connect host (default: 127.0.0.1)
 """
@@ -43,7 +43,6 @@ from collections import defaultdict
 trange = range
 # ── make local python package importable ──────────────────────────────────────
 EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(EXAMPLES_DIR, '..', 'python'))
 
 THRIFT_FILE = os.path.join(EXAMPLES_DIR, 'example.thrift')
 
@@ -56,7 +55,7 @@ from thriftpy2.contrib.aio.transport import TAsyncBufferedTransportFactory
 
 HAS_THRIFTPY2 = True
 
-from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport, make_client as rs_make_client, \
+from thriftrs2 import load as rs_load, TBufferedTransport, make_client as rs_make_client, \
     make_server as rs_make_server
 
 HAS_RS = True
@@ -112,9 +111,9 @@ def init(thrift_mod):
 
 
 def start_rs_server(host: str, port: int) -> None:
-    """Start the thrift_rs_pyo3 server in a background OS thread (serve_nonblocking)."""
+    """Start the thriftrs2 server in a background OS thread (serve_nonblocking)."""
     if not HAS_RS:
-        raise RuntimeError("thrift_rs_pyo3 is not importable")
+        raise RuntimeError("thriftrs2 is not importable")
 
     thrift_mod = rs_load(THRIFT_FILE)
     server = rs_make_server(
@@ -153,7 +152,7 @@ def start_tp2_server(host: str, port: int) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def make_rs_client(host: str, port: int):
-    """Create a connected thrift_rs_pyo3 ThriftClient."""
+    """Create a connected thriftrs2 ThriftClient."""
     mod = rs_load(THRIFT_FILE)
     client = rs_make_client(
         mod.UserService,
@@ -382,9 +381,9 @@ def _comparison(rs_stats: dict, tp2_stats: dict) -> None:
         return
 
     print(f"\n{'═' * 62}")
-    print(f"  Comparison  (thrift_rs_pyo3  vs  thriftpy2)")
+    print(f"  Comparison  (thriftrs2  vs  thriftpy2)")
     print(f"{'═' * 62}")
-    print(f"  {'Metric':<22}  {'thrift_rs_pyo3':>16}  {'thriftpy2':>12}  {'rs/tp2':>8}")
+    print(f"  {'Metric':<22}  {'thriftrs2':>16}  {'thriftpy2':>12}  {'rs/tp2':>8}")
     print(f"  {'-' * 22}  {'-' * 16}  {'-' * 12}  {'-' * 8}")
 
     rows = [
@@ -407,7 +406,7 @@ def _comparison(rs_stats: dict, tp2_stats: dict) -> None:
         print(f"  {label:<22}  {rs_v:>15{fmt}}  {tp2_v:>12{fmt}}  {ratio:>7.3f}x{mark}")
 
     print()
-    print("  ✓ = thrift_rs_pyo3 wins   ✗ = thriftpy2 wins")
+    print("  ✓ = thriftrs2 wins   ✗ = thriftpy2 wins")
     print()
 
 
@@ -466,7 +465,7 @@ def main() -> None:
     print(f'  Warmup/server    : {wpt * args.concurrency}')
     print(f'  Op mix           : {args.mix}')
     print('  NOTE             : Running list-only benchmark (1000 pre-populated users)')
-    print(f'  thrift_rs_pyo3   : {host}:{rs_port}')
+    print(f'  thriftrs2        : {host}:{rs_port}')
     print(f'  thriftpy2        : {host}:{tp2_port}')
     print()
 
@@ -480,7 +479,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[WARN] rs server failed to start: {exc}")
     else:
-        print("[SKIP] thrift_rs_pyo3 not available")
+        print("[SKIP] thriftrs2 not available")
 
     if HAS_THRIFTPY2:
         try:
@@ -517,9 +516,9 @@ def main() -> None:
     tp2_stats = {}
 
     if rs_ok:
-        print(f'\n  → thrift_rs_pyo3 ({host}:{rs_port}) …')
+        print(f'\n  → thriftrs2      ({host}:{rs_port}) …')
         lats, errs, wall = _run_bench(host, rs_port, ops_mix, rpt, args.concurrency, use_rs=True)
-        rs_stats = _report('thrift_rs_pyo3', lats, errs, wall)
+        rs_stats = _report('thriftrs2', lats, errs, wall)
 
     if tp2_ok:
         print(f'\n  → thriftpy2       ({host}:{tp2_port}) …')

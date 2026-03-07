@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OCR Thrift server example using thrift_rs_pyo3.
+OCR Thrift server example using thriftrs2.
 
 This example starts an OCRService server that handles:
   - detect_text(request: ImageRequest) -> OCRResult
@@ -9,16 +9,14 @@ This example starts an OCRService server that handles:
 Run the server:
     python examples/ocr_server.py
 
-Then test it from another terminal by writing a small client or using thrift_rs_pyo3.load to call the service.
+Then test it from another terminal by writing a small client or using thriftrs2.load to call the service.
 """
 
 import os
-import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
-from thrift_rs_pyo3 import load, ThriftServer, TBufferedTransport
+from thriftrs2 import load, ThriftServer, TBufferedTransport
 
 # ---------------------------------------------------------------------------
 # Load the .thrift definition

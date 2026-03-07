@@ -1,10 +1,6 @@
 import os
-import sys
 
-# Ensure local python package is importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
-from thrift_rs_pyo3 import load, serialize, deserialize, ProtocolType, loads, dumps
+from thriftrs2 import load, serialize, deserialize, ProtocolType, loads, dumps
 
 
 def test_compact():

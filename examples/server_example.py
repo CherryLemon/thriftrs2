@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thrift server example using thrift_rs_pyo3.
+Thrift server example using thriftrs2.
 
 This example starts a UserService server that handles:
   - get_user(user_id)  -> User
@@ -14,7 +14,8 @@ Then test it from another terminal (or run client_example.py).
 """
 import asyncio
 import os
-from thrift_rs_pyo3 import load, ThriftServer, TBufferedTransport, make_server
+
+from thriftrs2 import load, ThriftServer, TBufferedTransport, make_server
 # ---------------------------------------------------------------------------
 # Load the .thrift definition (same file used by test.py)
 # ---------------------------------------------------------------------------

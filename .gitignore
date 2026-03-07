@@ -1,3 +1,10 @@
-.venv
-target
+.venv/
+target/
+build/
+dist/
 *.so
+*.whl
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.maturin/
