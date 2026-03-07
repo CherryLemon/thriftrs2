@@ -2,9 +2,6 @@
 // parser.rs  –  ThriftParser and BinaryProtocol Python bindings
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::parser::{ast::*, Parser};
-use crate::python::serde::{
-    deserialize_struct_fields_as_instance, serialize_struct_any,
-};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;

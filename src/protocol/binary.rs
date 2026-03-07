@@ -42,22 +42,6 @@ impl<R: Read> BinaryProtocolReader<R> {
 }
 
 impl<R: Read> TInputProtocol for BinaryProtocolReader<R> {
-    fn read_u8_raw(&mut self) -> Result<u8, ProtocolError> {
-        Ok(self.reader.read_u8()?)
-    }
-
-    fn read_i16_raw(&mut self) -> Result<i16, ProtocolError> {
-        Ok(self.reader.read_i16::<BigEndian>()?)
-    }
-
-    fn read_i32_raw(&mut self) -> Result<i32, ProtocolError> {
-        Ok(self.reader.read_i32::<BigEndian>()?)
-    }
-
-    fn read_i64_raw(&mut self) -> Result<i64, ProtocolError> {
-        Ok(self.reader.read_i64::<BigEndian>()?)
-    }
-
     fn read_message_begin(&mut self) -> Result<MessageBegin, ProtocolError> {
         let version_and_type = self.reader.read_u32::<BigEndian>()?;
         if version_and_type & 0xffff0000 != THRIFT_VERSION_1 {
@@ -197,6 +181,22 @@ impl<R: Read> TInputProtocol for BinaryProtocolReader<R> {
 
     fn read_set_end(&mut self) -> Result<(), ProtocolError> {
         Ok(())
+    }
+
+    fn read_u8_raw(&mut self) -> Result<u8, ProtocolError> {
+        Ok(self.reader.read_u8()?)
+    }
+
+    fn read_i16_raw(&mut self) -> Result<i16, ProtocolError> {
+        Ok(self.reader.read_i16::<BigEndian>()?)
+    }
+
+    fn read_i32_raw(&mut self) -> Result<i32, ProtocolError> {
+        Ok(self.reader.read_i32::<BigEndian>()?)
+    }
+
+    fn read_i64_raw(&mut self) -> Result<i64, ProtocolError> {
+        Ok(self.reader.read_i64::<BigEndian>()?)
     }
 }
 

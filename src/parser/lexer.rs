@@ -1,13 +1,13 @@
+use nom::character::complete::alpha1;
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take_while, take_while1, take_until},
-    character::complete::{char, digit1, multispace0, multispace1},
+    bytes::complete::{tag, take_until, take_while},
+    character::complete::{char, digit1, multispace1},
     combinator::{map, opt, recognize, value},
-    multi::{many0, separated_list0},
-    sequence::{delimited, pair, preceded, terminated},
+    multi::many0,
+    sequence::{delimited, pair, preceded},
     IResult, Parser,
 };
-use nom::character::complete::alpha1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {

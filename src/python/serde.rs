@@ -26,12 +26,6 @@ pub(crate) struct RustStructValue {
     pub values: HashMap<String, ThriftValue>,
 }
 
-impl RustStructValue {
-    pub fn set_field(&mut self, name: &str, value: ThriftValue) {
-        self.values.insert(name.to_string(), value);
-    }
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Type helpers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -291,7 +285,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                 .first()
                 .map(|v| thrift_value_ttype(v))
                 .unwrap_or(TType::String);
-            writer.write_list_begin(&crate::protocol::ListBegin {
+            writer.write_list_begin(&ListBegin {
                 element_type: elem_ttype,
                 size: items.len() as i32,
             })?;
@@ -305,7 +299,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                 .first()
                 .map(|v| thrift_value_ttype(v))
                 .unwrap_or(TType::String);
-            writer.write_set_begin(&crate::protocol::SetBegin {
+            writer.write_set_begin(&SetBegin {
                 element_type: elem_ttype,
                 size: items.len() as i32,
             })?;
@@ -319,7 +313,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                 .first()
                 .map(|(k, v)| (thrift_value_ttype(k), thrift_value_ttype(v)))
                 .unwrap_or((TType::String, TType::String));
-            writer.write_map_begin(&crate::protocol::MapBegin {
+            writer.write_map_begin(&MapBegin {
                 key_type: kt,
                 value_type: vt,
                 size: pairs.len() as i32,
@@ -352,7 +346,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                     .map(|f| f.id)
                     .unwrap_or(0);
                 let ttype = thrift_value_ttype(fval);
-                let field_begin = crate::protocol::FieldBegin {
+                let field_begin = FieldBegin {
                     name: None,
                     field_type: ttype,
                     id: field_id,
@@ -536,43 +530,43 @@ pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
             let val = reader
                 .read_bool()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().to_owned().into_any().unbind())
+            Ok(val.into_pyobject(py)?.to_owned().into_any().unbind())
         }
         ThriftType::Byte => {
             let val = reader
                 .read_byte()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::I16 => {
             let val = reader
                 .read_i16()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::I32 => {
             let val = reader
                 .read_i32()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::I64 => {
             let val = reader
                 .read_i64()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::Double => {
             let val = reader
                 .read_double()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::String => {
             let val = reader
                 .read_string()
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            Ok(val.into_pyobject(py).unwrap().into_any().unbind())
+            Ok(val.into_pyobject(py)?.into_any().unbind())
         }
         ThriftType::Binary => {
             let val = reader
@@ -738,13 +732,13 @@ pub(crate) fn thrift_value_to_py(
     struct_map: &Arc<HashMap<String, ThriftStruct>>,
 ) -> PyResult<Py<PyAny>> {
     match val {
-        ThriftValue::Bool(v) => Ok(v.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
-        ThriftValue::Byte(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I16(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I32(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::I64(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::Double(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
-        ThriftValue::String(v) => Ok(v.into_pyobject(py).unwrap().into_any().unbind()),
+        ThriftValue::Bool(v) => Ok(v.into_pyobject(py)?.to_owned().into_any().unbind()),
+        ThriftValue::Byte(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        ThriftValue::I16(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        ThriftValue::I32(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        ThriftValue::I64(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        ThriftValue::Double(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
+        ThriftValue::String(v) => Ok(v.into_pyobject(py)?.into_any().unbind()),
         ThriftValue::Binary(v) => Ok(PyBytes::new(py, v).into_any().unbind()),
         ThriftValue::List(items) | ThriftValue::Set(items) => {
             let list = PyList::empty(py);
