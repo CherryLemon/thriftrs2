@@ -7,11 +7,15 @@ use crate::protocol::{
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 use super::parser::ThriftParser;
 use super::serde::{deserialize_rust_struct, thrift_type_to_ttype, write_value_with_structs};
@@ -20,6 +24,149 @@ use super::types::{
     TransportType,
 };
 
+thread_local! {
+    static WORKER_PY_ASYNCIO: RefCell<Option<WorkerPythonAsyncio>> = RefCell::new(None);
+}
+
+struct WorkerPythonAsyncio {
+    locals: pyo3_async_runtimes::TaskLocals,
+    loop_thread: Option<JoinHandle<()>>,
+}
+
+impl WorkerPythonAsyncio {
+    fn start() -> Result<Self, String> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let loop_thread = std::thread::Builder::new()
+            .name("thrift-rs-pyo3-python-loop".to_string())
+            .spawn(move || {
+                let locals = match Python::attach(|py| -> PyResult<pyo3_async_runtimes::TaskLocals> {
+                    let asyncio = py.import("asyncio")?;
+                    let event_loop = asyncio.call_method0("new_event_loop")?;
+                    asyncio.call_method1("set_event_loop", (event_loop.clone(),))?;
+                    pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)
+                }) {
+                    Ok(locals) => locals,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err.to_string()));
+                        return;
+                    }
+                };
+
+                if ready_tx.send(Ok(locals.clone())).is_err() {
+                    return;
+                }
+
+                Python::attach(|py| {
+                    let event_loop = locals.event_loop(py);
+                    if let Err(err) = event_loop.call_method0("run_forever") {
+                        err.print_and_set_sys_last_vars(py);
+                    }
+                    if let Err(err) = shutdown_python_event_loop(&event_loop) {
+                        err.print_and_set_sys_last_vars(py);
+                    }
+                    if let Ok(asyncio) = py.import("asyncio") {
+                        let _ = asyncio.call_method1("set_event_loop", (py.None(),));
+                    }
+                });
+            })
+            .map_err(|err| format!("spawn python loop thread: {err}"))?;
+
+        let locals = ready_rx
+            .recv()
+            .map_err(|_| "python loop thread exited before initialization".to_string())?;
+        let locals = locals?;
+
+        Ok(Self {
+            locals,
+            loop_thread: Some(loop_thread),
+        })
+    }
+
+    fn stop(mut self) -> Result<(), String> {
+        Python::attach(|py| -> PyResult<()> {
+            let event_loop = self.locals.event_loop(py);
+            if !event_loop.call_method0("is_closed")?.extract::<bool>()? {
+                let stop = event_loop.getattr("stop")?;
+                event_loop.call_method1("call_soon_threadsafe", (stop,))?;
+            }
+            Ok(())
+        })
+        .map_err(|err| err.to_string())?;
+
+        if let Some(handle) = self.loop_thread.take() {
+            handle
+                .join()
+                .map_err(format_thread_panic_payload)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn ensure_current_worker_python_asyncio() -> Result<(), String> {
+    WORKER_PY_ASYNCIO.with(|slot| {
+        if slot.borrow().is_some() {
+            return Ok(());
+        }
+
+        let binding = WorkerPythonAsyncio::start()?;
+        *slot.borrow_mut() = Some(binding);
+        Ok(())
+    })
+}
+
+fn current_worker_python_locals() -> Result<pyo3_async_runtimes::TaskLocals, String> {
+    ensure_current_worker_python_asyncio()?;
+    WORKER_PY_ASYNCIO.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|binding| binding.locals.clone())
+            .ok_or_else(|| {
+                "python asyncio loop is not bound to the current tokio worker thread".to_string()
+            })
+    })
+}
+
+fn shutdown_current_worker_python_asyncio() -> Result<(), String> {
+    WORKER_PY_ASYNCIO.with(|slot| match slot.borrow_mut().take() {
+        Some(binding) => binding.stop(),
+        None => Ok(()),
+    })
+}
+
+fn shutdown_python_event_loop(event_loop: &Bound<'_, PyAny>) -> PyResult<()> {
+    let py = event_loop.py();
+    if event_loop.call_method0("is_closed")?.extract::<bool>()? {
+        return Ok(());
+    }
+
+    event_loop.call_method1(
+        "run_until_complete",
+        (event_loop.call_method0("shutdown_asyncgens")?,),
+    )?;
+
+    if event_loop.hasattr("shutdown_default_executor")? {
+        event_loop.call_method1(
+            "run_until_complete",
+            (event_loop.call_method0("shutdown_default_executor")?,),
+        )?;
+    }
+
+    event_loop.call_method0("close")?;
+    let _ = py;
+    Ok(())
+}
+
+fn format_thread_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else {
+        "python loop thread panicked".to_string()
+    }
+}
+
 #[pyclass]
 pub struct ThriftServer {
     service: PyThriftService,
@@ -27,6 +174,10 @@ pub struct ThriftServer {
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
     workers: usize,
+    // Indicates whether the server is currently running (serve/serve_nonblocking).
+    running: Arc<AtomicBool>,
+    // Notify used to signal a graceful shutdown to the accept loop/runtime.
+    shutdown: Arc<Notify>,
 }
 
 #[pymethods]
@@ -40,6 +191,8 @@ impl ThriftServer {
             struct_map: Arc::new(HashMap::new()),
             transport,
             workers,
+            running: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(Notify::new()),
         }
     }
 
@@ -71,40 +224,17 @@ impl ThriftServer {
         self.handlers.insert(method_name.to_string(), handler);
     }
 
-    pub fn serve(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
-        let addr = format!("{}:{}", host, port);
-        let service = Arc::new(self.service.clone());
-        let handlers: Arc<HashMap<String, Py<PyAny>>> = Arc::new(
-            self.handlers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone_ref(py)))
-                .collect(),
-        );
-        let struct_map = Arc::clone(&self.struct_map);
-        let transport = self.transport;
-        let n_workers = if self.workers == 0 {
-            num_cpus::get().max(2)
-        } else {
-            self.workers
-        };
-
-        let rt = build_runtime(n_workers).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("tokio runtime: {}", e))
-        })?;
-
-        println!(
-            "ThriftServer ({:?}, {} workers) listening on {}",
-            transport, n_workers, addr
-        );
-
-        py.detach(|| {
-            rt.block_on(accept_loop(addr, service, handlers, struct_map, transport));
-        });
-
-        Ok(())
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 
-    pub fn serve_nonblocking(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
+    pub fn serve(&self, py: Python<'_>, host: &str, port: u16) -> PyResult<()> {
+        // Prevent starting multiple servers concurrently.
+        if self.running.load(Ordering::SeqCst) {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "server already running",
+            ));
+        }
         let addr = format!("{}:{}", host, port);
         let service = Arc::new(self.service.clone());
         let handlers: Arc<HashMap<String, Py<PyAny>>> = Arc::new(
@@ -125,28 +255,52 @@ impl ThriftServer {
             PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("tokio runtime: {}", e))
         })?;
 
-        println!(
-            "ThriftServer (non-blocking, {:?}, {} workers) listening on {}",
-            transport, n_workers, addr
-        );
+         // Mark as running and pass a clone into the accept loop so it can
+         // clear the flag if the loop exits.
+         let running = Arc::clone(&self.running);
+         let shutdown = Arc::clone(&self.shutdown);
+
+         println!(
+             "ThriftServer ({:?}, {} workers) listening on {}",
+             transport, n_workers, addr
+         );
 
         std::thread::spawn(move || {
-            rt.block_on(accept_loop(addr, service, handlers, struct_map, transport));
+             rt.block_on(accept_loop(addr, service, handlers, struct_map, transport, running, shutdown));
         });
 
         Ok(())
     }
-}
 
-// ──────────────────────────────────────────────────────────────────────────────
+     /// Stop the running server (if any). This will notify the accept loop to exit
+     /// and clear the `running` flag.
+     pub fn stop(&self) {
+         // Clear the running flag and notify the runtime to shutdown the accept loop.
+         self.running.store(false, Ordering::SeqCst);
+         self.shutdown.notify_waiters();
+     }
+ }
+
+ // ──────────────────────────────────────────────────────────────────────────────
 // Runtime builder
 // ──────────────────────────────────────────────────────────────────────────────
 
 fn build_runtime(n_workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
         .worker_threads(n_workers)
         .enable_all()
-        .build()
+        .on_thread_start(|| {
+            if let Err(err) = ensure_current_worker_python_asyncio() {
+                eprintln!("python asyncio worker init error: {err}");
+            }
+        })
+        .on_thread_stop(|| {
+            if let Err(err) = shutdown_current_worker_python_asyncio() {
+                eprintln!("python asyncio worker shutdown error: {err}");
+            }
+        });
+    builder.build()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -154,50 +308,71 @@ fn build_runtime(n_workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn accept_loop(
-    addr: String,
-    service: Arc<PyThriftService>,
-    handlers: Arc<HashMap<String, Py<PyAny>>>,
-    struct_map: Arc<HashMap<String, ThriftStruct>>,
-    transport: TransportType,
-) {
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("bind error on {}: {}", addr, e);
-            return;
-        }
-    };
+     addr: String,
+     service: Arc<PyThriftService>,
+     handlers: Arc<HashMap<String, Py<PyAny>>>,
+     struct_map: Arc<HashMap<String, ThriftStruct>>,
+     transport: TransportType,
+     running: Arc<AtomicBool>,
+     shutdown: Arc<Notify>,
+ ) {
+     let listener = match TcpListener::bind(&addr).await {
+         Ok(l) => l,
+         Err(e) => {
+             eprintln!("bind error on {}: {}", addr, e);
+             return;
+         }
+     };
+     running.store(true, Ordering::SeqCst);
+     loop {
+         // Listen for either a shutdown signal (programmatic) or Ctrl+C, or an incoming connection.
+         tokio::select! {
+             _ = shutdown.notified() => {
+                 println!("shutdown requested");
+                 break;
+             }
+             _ = tokio::signal::ctrl_c() => {
+                 println!("received Ctrl+C, shutting down");
+                 break;
+             }
+             accept_res = listener.accept() => {
+                 let (stream, _peer) = match accept_res {
+                     Ok(v) => v,
+                     Err(e) => {
+                         eprintln!("accept error: {}", e);
+                         continue;
+                     }
+                 };
+ 
+                 let service = Arc::clone(&service);
+                 let handlers = Arc::clone(&handlers);
+                 let struct_map = Arc::clone(&struct_map);
+ 
+                 tokio::spawn(async move {
+                     if let Err(e) =
+                         handle_connection(stream, service, handlers, struct_map, transport).await
+                     {
+                         use std::io::ErrorKind::*;
+                         if e.kind() != UnexpectedEof
+                             && e.kind() != ConnectionReset
+                             && e.kind() != BrokenPipe
+                         {
+                             eprintln!("connection error: {}", e);
+                         }
+                     }
+                 });
+             }
+         }
+     }
+ 
+     // If we ever break out of the accept loop, clear the running flag.
+     // (In normal operation the loop is infinite; this ensures correctness
+     // if the loop ever ends.)
+     // Note: unreachable in the current design, but kept for completeness.
+     running.store(false, Ordering::SeqCst);
+ }
 
-    loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("accept error: {}", e);
-                continue;
-            }
-        };
-
-        let service = Arc::clone(&service);
-        let handlers = Arc::clone(&handlers);
-        let struct_map = Arc::clone(&struct_map);
-
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, service, handlers, struct_map, transport).await
-            {
-                use std::io::ErrorKind::*;
-                if e.kind() != UnexpectedEof
-                    && e.kind() != ConnectionReset
-                    && e.kind() != BrokenPipe
-                {
-                    eprintln!("connection error: {}", e);
-                }
-            }
-        });
-    }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
+ // ──────────────────────────────────────────────────────────────────────────────
 // Async connection handler
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -296,67 +471,149 @@ async fn handle_connection(
                     continue;
                 }
 
-                // Clone what we need to move into Python::attach (not async).
+                // Clone what we need to move into closures.
                 let method = method.clone();
                 let struct_map2 = Arc::clone(&struct_map);
                 let handlers2 = Arc::clone(&handlers);
                 let method_name = msg_begin.name.clone();
                 let seq_id = msg_begin.seq_id;
 
-                // Spawn a blocking thread so the async executor is not blocked
-                // while we hold the GIL.
-                let result: Result<Vec<u8>, String> =
-                    tokio::task::spawn_blocking(move || {
-                        Python::attach(|py| {
-                            let handler = handlers2.get(&method_name)
-                                .expect("handler checked above")
-                                .clone_ref(py);
+                // Detect whether the handler is a coroutine function (async def)
+                // and build kwargs — all done while holding the GIL briefly.
+                enum CallOutcome {
+                    /// Sync handler returned a value directly.
+                    Sync(Vec<u8>),
+                    /// Async handler; yields a coroutine to drive via tokio.
+                    Async(Py<PyAny>),
+                }
 
-                            let schema: Arc<HashMap<String, ThriftField>> = Arc::new(method
-                                .arguments
-                                .iter()
-                                .map(|f| (f.name.clone(), f.clone()))
-                                .collect());
-                            let args_instance = ThriftStructInstance::from_rust(
-                                args_struct_name,
-                                Arc::new(args_field_names),
-                                args_values,
-                                schema,
-                                Arc::clone(&struct_map2),
-                            );
-                            let py_args = Bound::new(py, args_instance)?;
+                let outcome: Result<CallOutcome, String> =
+                    tokio::task::spawn_blocking({
+                        let method = method.clone();
+                        let struct_map2 = Arc::clone(&struct_map2);
+                        let handlers2 = Arc::clone(&handlers2);
+                        let method_name = method_name.clone();
+                        let args_struct_name = args_struct_name.clone();
+                        let args_field_names = args_field_names.clone();
+                        let args_values = args_values.clone();
+                        move || {
+                            Python::attach(|py| {
+                                let handler = handlers2
+                                    .get(&method_name)
+                                    .expect("handler checked above")
+                                    .clone_ref(py);
 
-                            let kwargs = PyDict::new(py);
-                            let mut inst_borrow = py_args.borrow_mut();
-                            let field_names: Vec<String> =
-                                inst_borrow.field_names.as_ref().clone();
-                            for name in &field_names {
-                                let val = inst_borrow
-                                    .get_field(py, name)
-                                    .map(|v| v.unbind())
-                                    .unwrap_or_else(|| py.None());
-                                kwargs.set_item(name, val)?;
-                            }
-                            drop(inst_borrow);
+                                // Detect async def *before* calling.
+                                let is_async_fn: bool = py
+                                    .import("inspect")?
+                                    .call_method1(
+                                        "iscoroutinefunction",
+                                        (handler.bind(py),),
+                                    )?
+                                    .extract()?;
 
-                            let result =
-                                handler.call(py, (), Some(&kwargs))?;
-                            let reply_body = build_reply_body(
-                                py,
-                                &method.return_type,
-                                result.bind(py),
-                                &struct_map2,
-                            )?;
-                            Ok::<Vec<u8>, PyErr>(build_reply_frame(
-                                &method_name,
-                                seq_id,
-                                &reply_body,
-                            ))
-                        })
-                        .map_err(|e: PyErr| e.to_string())
+                                let schema: Arc<HashMap<String, ThriftField>> =
+                                    Arc::new(
+                                        method
+                                            .arguments
+                                            .iter()
+                                            .map(|f| (f.name.clone(), f.clone()))
+                                            .collect(),
+                                    );
+                                let args_instance = ThriftStructInstance::from_rust(
+                                    args_struct_name,
+                                    Arc::new(args_field_names),
+                                    args_values,
+                                    schema,
+                                    Arc::clone(&struct_map2),
+                                );
+                                let py_args = Bound::new(py, args_instance)?;
+
+                                let kwargs = PyDict::new(py);
+                                let mut inst_borrow = py_args.borrow_mut();
+                                let field_names: Vec<String> =
+                                    inst_borrow.field_names.as_ref().clone();
+                                for name in &field_names {
+                                    let val = inst_borrow
+                                        .get_field(py, name)
+                                        .map(|v| v.unbind())
+                                        .unwrap_or_else(|| py.None());
+                                    kwargs.set_item(name, val)?;
+                                }
+                                drop(inst_borrow);
+
+                                let call_result =
+                                    handler.call(py, (), Some(&kwargs))?;
+
+                                if is_async_fn {
+                                    // Return the coroutine object; we'll drive it
+                                    // natively on the tokio task via pyo3-async-runtimes.
+                                    Ok::<CallOutcome, PyErr>(CallOutcome::Async(
+                                        call_result,
+                                    ))
+                                } else {
+                                    // Sync handler: build reply immediately.
+                                    let reply_body = build_reply_body(
+                                        py,
+                                        &method.return_type,
+                                        call_result.bind(py),
+                                        &struct_map2,
+                                    )?;
+                                    Ok(CallOutcome::Sync(build_reply_frame(
+                                        &method_name,
+                                        seq_id,
+                                        &reply_body,
+                                    )))
+                                }
+                            })
+                            .map_err(|e: PyErr| e.to_string())
+                        }
                     })
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()));
+
+                let result: Result<Vec<u8>, String> = match outcome {
+                    Err(e) => Err(e),
+                    Ok(CallOutcome::Sync(frame)) => Ok(frame),
+                    Ok(CallOutcome::Async(coro)) => match current_worker_python_locals() {
+                        Err(err) => Err(err),
+                        Ok(locals) => {
+                            let py_future: Result<_, String> = Python::attach(|py| {
+                                pyo3_async_runtimes::into_future_with_locals(
+                                    &locals,
+                                    coro.into_bound(py),
+                                )
+                                .map_err(|e: PyErr| e.to_string())
+                            });
+                            match py_future {
+                                Err(e) => Err(e),
+                                Ok(fut) => {
+                                    let py_result = fut.await;
+                                    Python::attach(|py| {
+                                        py_result
+                                            .map_err(|e: PyErr| e.to_string())
+                                            .and_then(|py_val| {
+                                                build_reply_body(
+                                                    py,
+                                                    &method.return_type,
+                                                    py_val.bind(py),
+                                                    &struct_map2,
+                                                )
+                                                .map_err(|e: PyErr| e.to_string())
+                                                .map(|body| {
+                                                    build_reply_frame(
+                                                        &method_name,
+                                                        seq_id,
+                                                        &body,
+                                                    )
+                                                })
+                                            })
+                                    })
+                                }
+                            }
+                        }
+                    },
+                };
 
                 match result {
                     Ok(frame) => frame,
