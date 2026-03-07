@@ -9,15 +9,16 @@ name = "thrift_rs_pyo3"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = "0.28.2"
+pyo3 = { version = "0.28.2", features = ["experimental-async"] }
 serde = { version = "1.0", features = ["derive"] }
 nom = "8.0.0"
 serde_json = "1.0"
 byteorder = "1.5"
 thiserror = "2.0.18"
 base64 = "0.22"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time", "signal"] }
 num_cpus = "1.16"
+pyo3-async-runtimes = { version = "0.28.0", features = ["tokio-runtime", "attributes"] }
 
 [profile.release]
 opt-level = 3

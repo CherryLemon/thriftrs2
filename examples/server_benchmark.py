@@ -48,33 +48,18 @@ sys.path.insert(0, os.path.join(EXAMPLES_DIR, '..', 'python'))
 THRIFT_FILE = os.path.join(EXAMPLES_DIR, 'example.thrift')
 
 # ── import backends ────────────────────────────────────────────────────────────
-try:
-    import thriftpy2
-    from thriftpy2.rpc import make_client as tp2_make_client, make_server as tp2_make_server
-    from thriftpy2.transport import TCyBufferedTransportFactory, TBufferedTransportFactory
-    HAS_THRIFTPY2 = True
-except ImportError:
-    HAS_THRIFTPY2 = False
-    print("[WARN] thriftpy2 not found")
-    # defined as None so static analysis won't flag undefined names
-    thriftpy2 = None
-    tp2_make_client = None
-    tp2_make_server = None
-    TCyBufferedTransportFactory = None
-    TBufferedTransportFactory = None
 
-try:
-    from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport, make_client as rs_make_client, make_server as rs_make_server
-    HAS_RS = True
-except ImportError:
-    HAS_RS = False
-    print("[WARN] thrift_rs_pyo3 not found")
-    # placeholder names for static analysis
-    rs_load = None
-    ThriftServer = None
-    TBufferedTransport = None
-    rs_make_client = None
-    rs_make_server = None
+import thriftpy2
+from thriftpy2.rpc import make_client as tp2_make_client, make_aio_server as tp2_make_server
+from thriftpy2.transport import TCyBufferedTransportFactory, TBufferedTransportFactory
+from thriftpy2.contrib.aio.transport import TAsyncBufferedTransportFactory
+
+HAS_THRIFTPY2 = True
+
+from thrift_rs_pyo3 import load as rs_load, ThriftServer, TBufferedTransport, make_client as rs_make_client, \
+    make_server as rs_make_server
+
+HAS_RS = True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,7 +83,7 @@ def init(thrift_mod):
     _db: dict = {}
     _next_id = [1001]
 
-    for i in range(1, 201):
+    for i in range(1, 11):
         _db[i] = thrift_mod.User(
             id=i,
             name=f"{_rand_str()}",
@@ -107,10 +92,10 @@ def init(thrift_mod):
         )
 
     class Handler:
-        def get_user(self, user_id):
+        async def get_user(self, user_id):
             return _db.get(user_id)
 
-        def create_user(self, user):
+        async def create_user(self, user):
             uid = user.id if user.id is not None else _next_id[0]
             if uid in _db:
                 return False
@@ -119,7 +104,7 @@ def init(thrift_mod):
             _next_id[0] = max(_next_id[0], uid + 1)
             return True
 
-        def list_users(self):
+        async def list_users(self):
             # Return snapshot without locking for the read-only benchmark
             return list(_db.values())
 
@@ -135,12 +120,10 @@ def start_rs_server(host: str, port: int) -> None:
     server = rs_make_server(
         thrift_mod.UserService,
         init(thrift_mod),
-        host=host,
-        port=port,
         workers=4
     )
 
-    _wait_port(host, port)
+    server.serve_forever(host, port, blocking=False)
     print(f"[rs   ] server ready on {host}:{port}")
 
 
@@ -156,7 +139,7 @@ def start_tp2_server(host: str, port: int) -> None:
         init(thrift_mod),
         host=host,
         port=port,
-        trans_factory=TCyBufferedTransportFactory(),
+        trans_factory=TAsyncBufferedTransportFactory(),
     )
 
     t = threading.Thread(target=server.serve, daemon=True)
@@ -201,12 +184,12 @@ def _rand_str(n: int = 8) -> str:
 
 
 def _bench_worker(
-    host: str,
-    port: int,
-    ops_mix: list,
-    n_requests: int,
-    result_queue: multiprocessing.Queue,  # will receive (latencies_list, errors_list)
-    use_rs: bool = False,
+        host: str,
+        port: int,
+        ops_mix: list,
+        n_requests: int,
+        result_queue: multiprocessing.Queue,  # will receive (latencies_list, errors_list)
+        use_rs: bool = False,
 ) -> None:
     """Process worker: performs requests and puts (latencies, errors) into result_queue."""
     try:
@@ -243,6 +226,7 @@ def _bench_worker(
                         })
                         client.call("create_user", user=user)
                 else:
+                    client, thrift_mod = make_tp2_client(host, port)
                     if op == 'get':
                         uid = random.randint(1, 5)
                         client.get_user(uid)
@@ -286,12 +270,12 @@ def _percentile(data: list, pct: float) -> float:
 
 
 def _run_bench(
-    host: str,
-    port: int,
-    ops_mix: list,
-    requests_per_thread: int,
-    concurrency: int,
-    use_rs: bool = False,
+        host: str,
+        port: int,
+        ops_mix: list,
+        requests_per_thread: int,
+        concurrency: int,
+        use_rs: bool = False,
 ) -> tuple:
     """
     Spawn `concurrency` processes, each making `requests_per_thread` calls.
@@ -345,7 +329,7 @@ def _report(name: str, all_latencies: list, all_errors: list, wall: float) -> di
             per_op[op].append(lat)
 
     total = len(flat)
-    errs  = len(all_errors)
+    errs = len(all_errors)
 
     print(f"\n{'═' * 62}")
     print(f"  {name}")
@@ -357,12 +341,12 @@ def _report(name: str, all_latencies: list, all_errors: list, wall: float) -> di
             print(f"     {e}")
         return {}
 
-    mean_ms = statistics.mean(flat)    * 1e3
-    p50_ms  = _percentile(flat, 50)    * 1e3
-    p90_ms  = _percentile(flat, 90)    * 1e3
-    p99_ms  = _percentile(flat, 99)    * 1e3
-    p999_ms = _percentile(flat, 99.9)  * 1e3
-    tput    = total / wall
+    mean_ms = statistics.mean(flat) * 1e3
+    p50_ms = _percentile(flat, 50) * 1e3
+    p90_ms = _percentile(flat, 90) * 1e3
+    p99_ms = _percentile(flat, 99) * 1e3
+    p999_ms = _percentile(flat, 99.9) * 1e3
+    tput = total / wall
 
     print(f"  Requests        : {total}  (errors: {errs})")
     print(f"  Wall time       : {wall:.3f} s")
@@ -377,9 +361,9 @@ def _report(name: str, all_latencies: list, all_errors: list, wall: float) -> di
     if len(per_op) > 1:
         print(f"  Per-op breakdown  (mean ms / p90 ms / count)")
         for op in sorted(per_op):
-            lats  = per_op[op]
+            lats = per_op[op]
             pmean = statistics.mean(lats) * 1e3
-            pp90  = _percentile(lats, 90) * 1e3
+            pp90 = _percentile(lats, 90) * 1e3
             print(f"    {op:<10}: mean={pmean:7.3f}  p90={pp90:7.3f}  n={len(lats)}")
 
     if all_errors:
@@ -401,19 +385,19 @@ def _comparison(rs_stats: dict, tp2_stats: dict) -> None:
     print(f"  Comparison  (thrift_rs_pyo3  vs  thriftpy2)")
     print(f"{'═' * 62}")
     print(f"  {'Metric':<22}  {'thrift_rs_pyo3':>16}  {'thriftpy2':>12}  {'rs/tp2':>8}")
-    print(f"  {'-'*22}  {'-'*16}  {'-'*12}  {'-'*8}")
+    print(f"  {'-' * 22}  {'-' * 16}  {'-' * 12}  {'-' * 8}")
 
     rows = [
-        ("Throughput (ops/s)", 'tput',  True,  '.1f'),
-        ("Mean latency (ms)",  'mean',  False, '.3f'),
-        ("P50 latency (ms)",   'p50',   False, '.3f'),
-        ("P90 latency (ms)",   'p90',   False, '.3f'),
-        ("P99 latency (ms)",   'p99',   False, '.3f'),
-        ("P99.9 latency (ms)", 'p999',  False, '.3f'),
+        ("Throughput (ops/s)", 'tput', True, '.1f'),
+        ("Mean latency (ms)", 'mean', False, '.3f'),
+        ("P50 latency (ms)", 'p50', False, '.3f'),
+        ("P90 latency (ms)", 'p90', False, '.3f'),
+        ("P99 latency (ms)", 'p99', False, '.3f'),
+        ("P99.9 latency (ms)", 'p999', False, '.3f'),
     ]
 
     for label, key, higher_better, fmt in rows:
-        rs_v  = rs_stats[key]
+        rs_v = rs_stats[key]
         tp2_v = tp2_stats[key]
         ratio = rs_v / tp2_v if tp2_v else float('inf')
         if higher_better:
@@ -437,7 +421,7 @@ def parse_mix(mix_str: str) -> list:
     for part in mix_str.split(','):
         op, _, weight = part.partition(':')
         op = op.strip()
-        w  = int(weight.strip()) if weight.strip() else 1
+        w = int(weight.strip()) if weight.strip() else 1
         expanded.extend([op] * w)
     if not expanded:
         raise ValueError(f"Invalid mix string: {mix_str!r}")
@@ -449,30 +433,30 @@ def main() -> None:
         description='Concurrent Thrift RPC server benchmark',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('-n', '--requests',    type=int, default=15000,
+    ap.add_argument('-n', '--requests', type=int, default=15000,
                     help='Total requests per server (default: 2000)')
     ap.add_argument('-c', '--concurrency', type=int, default=30,
                     help='Concurrent client threads (default: 20)')
-    ap.add_argument('--warmup',            type=int, default=200,
+    ap.add_argument('--warmup', type=int, default=200,
                     help='Warmup requests per server (default: 200)')
-    ap.add_argument('--mix',               default='get:5,list:3,create:2',
+    ap.add_argument('--mix', default='get:5,list:3,create:2',
                     help='Op mix (default: get:5,list:3,create:2)')
-    ap.add_argument('--rs-port',           type=int, default=9191)
-    ap.add_argument('--tp2-port',          type=int, default=9192)
-    ap.add_argument('--host',              default='127.0.0.1')
+    ap.add_argument('--rs-port', type=int, default=9191)
+    ap.add_argument('--tp2-port', type=int, default=9192)
+    ap.add_argument('--host', default='127.0.0.1')
     args = ap.parse_args()
 
     if not HAS_THRIFTPY2:
         sys.exit("thriftpy2 is required for the client side of this benchmark.")
 
     # Force the benchmark to exercise only the list_users path.
-    ops_mix  = ['list']
-    host     = args.host
-    rs_port  = args.rs_port
+    ops_mix = ['list']
+    host = args.host
+    rs_port = args.rs_port
     tp2_port = args.tp2_port
 
-    rpt = max(1, args.requests // args.concurrency)   # requests per thread
-    wpt = max(1, args.warmup   // args.concurrency)   # warmup per thread
+    rpt = max(1, args.requests // args.concurrency)  # requests per thread
+    wpt = max(1, args.warmup // args.concurrency)  # warmup per thread
 
     print('═' * 62)
     print('  Thrift RPC Concurrent Server Benchmark')
@@ -508,7 +492,7 @@ def main() -> None:
     if not rs_ok and not tp2_ok:
         sys.exit("No servers could be started; aborting.")
 
-    time.sleep(0.3)   # brief settle
+    time.sleep(0.3)  # brief settle
 
     # ── warmup ────────────────────────────────────────────────────────────────
     wc = min(args.concurrency, 5)
@@ -529,7 +513,7 @@ def main() -> None:
     # ── benchmark ─────────────────────────────────────────────────────────────
     print('\nRunning benchmark...')
 
-    rs_stats  = {}
+    rs_stats = {}
     tp2_stats = {}
 
     if rs_ok:
@@ -548,4 +532,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-

@@ -12,21 +12,15 @@ Run the server:
 
 Then test it from another terminal (or run client_example.py).
 """
-
+import asyncio
 import os
-import sys
-import time
-import threading
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
-
-from thrift_rs_pyo3 import load, ThriftServer, TBufferedTransport
+from thrift_rs_pyo3 import load, ThriftServer, TBufferedTransport, make_server
 # ---------------------------------------------------------------------------
 # Load the .thrift definition (same file used by test.py)
 # ---------------------------------------------------------------------------
 THRIFT_FILE = os.path.join(os.path.dirname(__file__), "example.thrift")
 thrift_module = load(THRIFT_FILE)
-service_def = thrift_module._parser.get_service("UserService")
+service_def = thrift_module.UserService
 User = thrift_module.User
 # ---------------------------------------------------------------------------
 # In-memory "database"
@@ -47,52 +41,51 @@ _next_id = 3
 #   - void     -> None
 # ---------------------------------------------------------------------------
 
-def handle_get_user(user_id: int) -> dict | None:
-    """Return the User dict for the given id, or None if not found."""
-    print(f"  [server] get_user(user_id={user_id})")
-    return _users.get(user_id)
+class Handler:
+    def get_user(self, user_id: int) -> dict | None:
+        """Return the User dict for the given id, or None if not found."""
+        print(f"  [server] get_user(user_id={user_id})")
+        return _users.get(user_id)
 
 
-def handle_create_user(user: dict) -> bool:
-    """Insert a new user; returns True on success."""
-    global _next_id
-    uid = user.id
-    if uid is None:
-        uid = _next_id
-        user.id = uid
-    if uid in _users:
-        print(f"  [server] create_user -> already exists id={uid}")
-        return False
-    _users[uid] = user
-    _next_id = max(_next_id, uid + 1)
-    print(f"  [server] create_user -> created id={uid}")
-    return True
+    def create_user(self, user: dict) -> bool:
+        """Insert a new user; returns True on success."""
+        global _next_id
+        uid = user.id
+        if uid is None:
+            uid = _next_id
+            user.id = uid
+        if uid in _users:
+            print(f"  [server] create_user -> already exists id={uid}")
+            return False
+        _users[uid] = user
+        _next_id = max(_next_id, uid + 1)
+        print(f"  [server] create_user -> created id={uid}")
+        return True
 
 
-def handle_list_users() -> list:
-    """Return all users as a list of dicts."""
-    print(f"  [server] list_users -> {len(_users)} users")
-    return list(_users.values())
+    async def list_users(self) -> list:
+        """Return all users as a list of dicts."""
+        print(f"  [server] list_users -> {len(_users)} users")
+        return list(_users.values())
 
 
 # ---------------------------------------------------------------------------
 # Build and start the server
 # ---------------------------------------------------------------------------
 
-def main():
-    server = ThriftServer(service_def, TBufferedTransport.transport_type)
-    server.set_parser(thrift_module._parser)
-
-    server.register_handler("get_user",    handle_get_user)
-    server.register_handler("create_user", handle_create_user)
-    server.register_handler("list_users",  handle_list_users)
-
+async def main():
     host, port = "127.0.0.1", 9090
+    server = make_server(
+        service_def,
+        Handler(),
+        transport=TBufferedTransport.transport_type,
+        workers=4
+    )
     print(f"Starting UserService on {host}:{port}  (Ctrl-C to stop)")
-    # serve() blocks and dispatches each connection in its own thread.
-    server.serve(host, port)
+    server.serve_forever(host, port)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
 
