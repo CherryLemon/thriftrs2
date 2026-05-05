@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Fast Apache Thrift bindings for Python powered by Rust and PyO3."
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/CherryLemon/thriftrs2"
 homepage = "https://github.com/CherryLemon/thriftrs2"
 keywords = ["thrift", "rpc", "serialization", "python", "pyo3"]

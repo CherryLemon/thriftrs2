@@ -156,18 +156,16 @@ maturin develop --release
 
 ## Publishing to PyPI
 
-Build distributables:
+Releases are built in CI (`.github/workflows/release.yml`). Push an annotated or lightweight tag `vX.Y.Z` after bumping `Cargo.toml` to trigger wheel builds, `twine check`, upload to PyPI via **Trusted Publishing (OIDC)**, and GitHub Release assets.
+
+Manual build:
 
 ```bash
 maturin build --release
 python -m twine check target/wheels/*
 ```
 
-Upload when ready:
-
-```bash
-python -m twine upload target/wheels/*
-```
+See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the maintainer checklist and PyPI publisher setup.
 
 ## Repository
 

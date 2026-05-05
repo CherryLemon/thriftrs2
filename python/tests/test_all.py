@@ -10,6 +10,11 @@ def test_public_exports_include_json_protocol():
     assert thriftrs2.JSONProtocol is not None
 
 
+def test_version_string_is_set():
+    assert isinstance(thriftrs2.__version__, str)
+    assert len(thriftrs2.__version__) > 0
+
+
 def test_round_trip_binary_serialization_from_example_schema():
     thrift_module = thriftrs2.load(str(EXAMPLE_THRIFT))
     user_data = {

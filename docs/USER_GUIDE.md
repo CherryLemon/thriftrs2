@@ -161,35 +161,53 @@ python examples/test_protocols.py
 
 ## 10. Release checklist
 
+The **release version** is defined only in `Cargo.toml` (`[package].version`). Maturin copies that into wheel/sdist metadata; `thriftrs2.__version__` reads it via `importlib.metadata` after install.
+
 Before publishing to PyPI:
 
-1. Confirm `Cargo.toml` and `pyproject.toml` versions match your intended release.
-2. Rebuild and reinstall the extension:
+1. Bump **`Cargo.toml`** only (no second copy in Python source).
+2. Update **`CHANGELOG.md`** and prepare GitHub Release notes.
+3. Rebuild and reinstall locally:
    ```bash
    maturin develop --release
    ```
-3. Run tests:
+4. Run tests:
    ```bash
    python -m pytest -q
    cargo check
    ```
-4. Build wheels:
-   ```bash
-   maturin build --release
-   ```
-5. Validate package metadata:
-   ```bash
-   python -m twine check target/wheels/*
-   ```
-6. Upload:
-   ```bash
-   python -m twine upload target/wheels/*
-   ```
+5. Tag and push (triggers CI wheels + optional PyPI upload), e.g. `v0.1.0`.
 
-## 11. Notes for maintainers
+Manual build (without CI):
+
+```bash
+maturin build --release
+python -m twine check target/wheels/*
+```
+
+## 11. PyPI Trusted Publishing (maintainers)
+
+CI publishes with **OIDC** (no long-lived PyPI password in secrets) when configured on PyPI:
+
+1. On [pypi.org](https://pypi.org/manage/account/publishing/), add a **pending publisher** for this repo: owner `CherryLemon`, repo `thriftrs2`, workflow `release.yml`, environment `pypi` (if the workflow uses that environment name).
+2. Optionally repeat for [TestPyPI](https://test.pypi.org/manage/account/publishing/) and use the `workflow_dispatch` input on `release.yml` to upload to TestPyPI first.
+3. After the first successful upload, finalize the project on PyPI if prompted.
+
+## 12. Notes for maintainers
 
 - The Python distribution name is `thriftrs2`.
 - The Python import name is also `thriftrs2`.
 - The native extension is built as `thriftrs2.thriftrs2` via maturin.
 - Examples are written to use the installed package rather than a checked-in `.so` file.
+
+### Post-release smoke (clean venv)
+
+```bash
+python -m venv .smoke-venv
+. .smoke-venv/bin/activate
+pip install dist/thriftrs2-*.whl   # or the wheel path from CI artifacts
+python examples/test.py
+deactivate
+rm -rf .smoke-venv
+```
 
