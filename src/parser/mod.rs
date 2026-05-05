@@ -224,6 +224,14 @@ impl Parser {
     }
 
     fn parse_method(&mut self) -> Result<ThriftMethod, ParseError> {
+        let oneway = match self.current_token()? {
+            Token::Keyword(keyword) if keyword == "oneway" => {
+                self.consume_token()?;
+                true
+            }
+            _ => false,
+        };
+
         let return_type = self.parse_type()?;
 
         let name = match self.consume_token()? {
@@ -256,6 +264,7 @@ impl Parser {
             return_type,
             arguments,
             exceptions: Vec::new(),
+            oneway,
         })
     }
 }

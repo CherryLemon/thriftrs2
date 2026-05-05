@@ -55,6 +55,7 @@ pub struct MessageBegin {
 
 #[derive(Debug, Clone)]
 pub struct FieldBegin {
+    #[allow(dead_code)]
     pub name: Option<String>,
     pub field_type: TType,
     pub id: i16,
@@ -108,6 +109,7 @@ impl From<ProtocolError> for std::io::Error {
 
 pub trait TInputProtocol {
     fn read_message_begin(&mut self) -> Result<MessageBegin, ProtocolError>;
+    #[allow(dead_code)]
     fn read_message_end(&mut self) -> Result<(), ProtocolError>;
     fn read_struct_begin(&mut self) -> Result<(), ProtocolError>;
     fn read_struct_end(&mut self) -> Result<(), ProtocolError>;
@@ -137,6 +139,7 @@ pub trait TInputProtocol {
 
 pub trait TOutputProtocol {
     fn write_message_begin(&mut self, identifier: &MessageBegin) -> Result<(), ProtocolError>;
+    #[allow(dead_code)]
     fn write_message_end(&mut self) -> Result<(), ProtocolError>;
     fn write_struct_begin(&mut self, name: &str) -> Result<(), ProtocolError>;
     fn write_struct_end(&mut self) -> Result<(), ProtocolError>;
@@ -154,7 +157,9 @@ pub trait TOutputProtocol {
     fn write_map_begin(&mut self, identifier: &MapBegin) -> Result<(), ProtocolError>;
     fn write_map_end(&mut self) -> Result<(), ProtocolError>;
     fn write_list_begin(&mut self, identifier: &ListBegin) -> Result<(), ProtocolError>;
+    #[allow(dead_code)]
     fn write_list_end(&mut self) -> Result<(), ProtocolError>;
     fn write_set_begin(&mut self, identifier: &SetBegin) -> Result<(), ProtocolError>;
+    #[allow(dead_code)]
     fn write_set_end(&mut self) -> Result<(), ProtocolError>;
 }

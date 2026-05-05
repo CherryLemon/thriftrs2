@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 pub const MESSAGE_TYPE_CALL: u8 = 1;
 pub const MESSAGE_TYPE_REPLY: u8 = 2;
 pub const MESSAGE_TYPE_EXCEPTION: u8 = 3;
+#[allow(dead_code)]
 pub const MESSAGE_TYPE_ONEWAY: u8 = 4;
 
 pub const THRIFT_VERSION_1: u32 = 0x80010000;
@@ -36,6 +37,7 @@ impl<R: Read> BinaryProtocolReader<R> {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub fn read_i64_raw(&mut self) -> std::io::Result<i64> {
         self.reader.read_i64::<BigEndian>()
     }

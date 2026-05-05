@@ -395,6 +395,7 @@ impl ThriftStructInstance {
         format!("{}({})", self.struct_name, fields.join(", "))
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_dict<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let d = PyDict::new(py);
         let names = self.field_names.clone();
@@ -449,6 +450,8 @@ pub struct PyThriftMethod {
     pub arguments: Vec<ThriftField>,
     #[pyo3(get)]
     pub exceptions: Vec<ThriftField>,
+    #[pyo3(get)]
+    pub oneway: bool,
     pub(crate) return_type: ThriftType,
     /// Pre-computed field-id → index map for argument deserialisation.
     pub(crate) arg_field_map: HashMap<i16, usize>,

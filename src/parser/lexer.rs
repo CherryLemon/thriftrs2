@@ -15,6 +15,7 @@ pub enum Token {
     Identifier(String),
     Number(i64),
     String(String),
+    #[allow(dead_code)]
     Symbol(char),
     Comma,
     Semicolon,

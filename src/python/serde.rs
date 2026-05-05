@@ -283,7 +283,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
         ThriftValue::List(items) => {
             let elem_ttype = items
                 .first()
-                .map(|v| thrift_value_ttype(v))
+                .map(thrift_value_ttype)
                 .unwrap_or(TType::String);
             writer.write_list_begin(&ListBegin {
                 element_type: elem_ttype,
@@ -297,7 +297,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
         ThriftValue::Set(items) => {
             let elem_ttype = items
                 .first()
-                .map(|v| thrift_value_ttype(v))
+                .map(thrift_value_ttype)
                 .unwrap_or(TType::String);
             writer.write_set_begin(&SetBegin {
                 element_type: elem_ttype,
@@ -413,7 +413,7 @@ pub(crate) fn deserialize_struct_fields_as_instance<'py, P: TInputProtocol>(
         Arc::clone(&struct_def.schema_arc),
         Arc::clone(&struct_def.struct_map),
     );
-    Ok(Bound::new(py, instance)?)
+    Bound::new(py, instance)
 }
 
 /// Read a single Thrift value from the wire into a `ThriftValue`, entirely

@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::protocol::{
     BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, MessageBegin, TInputProtocol,
-    TOutputProtocol, TType, MESSAGE_TYPE_EXCEPTION,
+    TOutputProtocol, TType, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -25,7 +25,7 @@ use super::types::{
 };
 
 thread_local! {
-    static WORKER_PY_ASYNCIO: RefCell<Option<WorkerPythonAsyncio>> = RefCell::new(None);
+    static WORKER_PY_ASYNCIO: RefCell<Option<WorkerPythonAsyncio>> = const { RefCell::new(None) };
 }
 
 struct WorkerPythonAsyncio {
@@ -624,7 +624,9 @@ async fn handle_connection(
             }
         };
 
-        send_response_async(&mut buf_writer, &response_payload, transport).await?;
+        if msg_begin.message_type != MESSAGE_TYPE_ONEWAY {
+            send_response_async(&mut buf_writer, &response_payload, transport).await?;
+        }
     }
 }
 
@@ -766,92 +768,13 @@ where
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Sync buffered-transport body reader  (kept for client.rs)
-// ──────────────────────────────────────────────────────────────────────────────
-
-pub(crate) fn read_buffered_struct_body<R: std::io::Read>(
-    reader: &mut R,
-    out: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    use byteorder::ReadBytesExt;
-
-    loop {
-        let field_type_byte = reader.read_u8()?;
-        out.push(field_type_byte);
-
-        if field_type_byte == 0x00 {
-            return Ok(());
-        }
-
-        let id_hi = reader.read_u8()?;
-        let id_lo = reader.read_u8()?;
-        out.push(id_hi);
-        out.push(id_lo);
-
-        read_buffered_value(reader, field_type_byte, out)?;
-    }
-}
-
-fn read_buffered_value<R: std::io::Read>(
-    reader: &mut R,
-    field_type_byte: u8,
-    out: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    use byteorder::ReadBytesExt;
-
-    match field_type_byte {
-        0x02 | 0x03 => { let b = reader.read_u8()?; out.push(b); }
-        0x06 => { let mut buf = [0u8; 2]; reader.read_exact(&mut buf)?; out.extend_from_slice(&buf); }
-        0x08 => { let mut buf = [0u8; 4]; reader.read_exact(&mut buf)?; out.extend_from_slice(&buf); }
-        0x0a | 0x04 => { let mut buf = [0u8; 8]; reader.read_exact(&mut buf)?; out.extend_from_slice(&buf); }
-        0x0b => {
-            let mut len_bytes = [0u8; 4];
-            reader.read_exact(&mut len_bytes)?;
-            out.extend_from_slice(&len_bytes);
-            let len = u32::from_be_bytes(len_bytes) as usize;
-            let start = out.len();
-            out.resize(start + len, 0);
-            reader.read_exact(&mut out[start..])?;
-        }
-        0x0c => { read_buffered_struct_body(reader, out)?; }
-        0x0d => {
-            let mut header = [0u8; 6];
-            reader.read_exact(&mut header)?;
-            out.extend_from_slice(&header);
-            let key_type = header[0];
-            let val_type = header[1];
-            let size = i32::from_be_bytes([header[2], header[3], header[4], header[5]]);
-            for _ in 0..size {
-                read_buffered_value(reader, key_type, out)?;
-                read_buffered_value(reader, val_type, out)?;
-            }
-        }
-        0x0f | 0x0e => {
-            let mut header = [0u8; 5];
-            reader.read_exact(&mut header)?;
-            out.extend_from_slice(&header);
-            let elem_type = header[0];
-            let size = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-            for _ in 0..size { read_buffered_value(reader, elem_type, out)?; }
-        }
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Unknown field type byte 0x{:02x} in buffered stream", field_type_byte),
-            ));
-        }
-    }
-    Ok(())
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
 // Reply builders
 // ──────────────────────────────────────────────────────────────────────────────
 
 use crate::parser::ast::ThriftType;
 
 fn build_reply_body(
-    py: Python<'_>,
+    _py: Python<'_>,
     return_type: &ThriftType,
     value: &Bound<'_, PyAny>,
     struct_map: &HashMap<String, ThriftStruct>,
@@ -877,8 +800,6 @@ fn build_reply_body(
     writer
         .write_field_stop()
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-    drop(writer);
-    let _ = py;
     Ok(buf)
 }
 

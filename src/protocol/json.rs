@@ -102,7 +102,7 @@ impl<W: Write> JSONProtocolWriter<W> {
             None => {
                 // No frame — write directly (standalone struct serialisation)
                 let s = serde_json::to_string(&v)
-                    .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))?;
                 self.writer.write_all(s.as_bytes())?;
             }
             Some(WriteFrame::Struct { current_field, obj }) => {
@@ -182,15 +182,15 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
     fn write_message_end(&mut self) -> Result<(), ProtocolError> {
         // Pop struct body frame.
         let body_frame = self.stack.pop()
-            .ok_or_else(|| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stack underflow")))?;
+            .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let body = Self::frame_to_value(body_frame);
         // Pop message frame.
         let msg_frame = self.stack.pop()
-            .ok_or_else(|| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stack underflow")))?;
+            .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         if let WriteFrame::Message { name, message_type, seq_id } = msg_frame {
             let msg = json!([1, name, message_type, seq_id, body]);
             let s = serde_json::to_string(&msg)
-                .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))?;
             self.writer.write_all(s.as_bytes())?;
         }
         Ok(())
@@ -206,12 +206,12 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
 
     fn write_struct_end(&mut self) -> Result<(), ProtocolError> {
         let frame = self.stack.pop()
-            .ok_or_else(|| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stack underflow")))?;
+            .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         if self.stack.is_empty() {
             // Outermost struct (standalone serialisation) — flush to writer.
             let s = serde_json::to_string(&v)
-                .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))?;
             self.writer.write_all(s.as_bytes())?;
         } else {
             self.push_value(v)?;
@@ -276,7 +276,7 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
 
     fn write_map_end(&mut self) -> Result<(), ProtocolError> {
         let frame = self.stack.pop()
-            .ok_or_else(|| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stack underflow")))?;
+            .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         self.push_value(v)
     }
@@ -291,7 +291,7 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
 
     fn write_list_end(&mut self) -> Result<(), ProtocolError> {
         let frame = self.stack.pop()
-            .ok_or_else(|| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::Other, "stack underflow")))?;
+            .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         self.push_value(v)
     }
@@ -321,13 +321,18 @@ enum ReadFrame {
         current_type: Option<TType>,
         current_value: Option<Value>,
     },
+    #[allow(dead_code)]
     List {
+        #[allow(dead_code)]
         elem_type: TType,
         items: Vec<Value>,
         index: usize,
     },
+    #[allow(dead_code)]
     Map {
+        #[allow(dead_code)]
         key_type: TType,
+        #[allow(dead_code)]
         val_type: TType,
         pairs: Vec<(Value, Value)>,
         index: usize,

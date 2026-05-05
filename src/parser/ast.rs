@@ -44,6 +44,7 @@ pub struct ThriftMethod {
     pub return_type: ThriftType,
     pub arguments: Vec<ThriftField>,
     pub exceptions: Vec<ThriftField>,
+    pub oneway: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

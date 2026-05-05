@@ -4,7 +4,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::protocol::{
     BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, MessageBegin, TInputProtocol,
-    TOutputProtocol, TType, MESSAGE_TYPE_CALL, MESSAGE_TYPE_EXCEPTION,
+    TOutputProtocol, TType, MESSAGE_TYPE_CALL, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -200,6 +200,7 @@ impl ThriftClient {
         let method = &self.service.methods[*method_idx];
 
         let seq_id = self.seq_id.fetch_add(1, Ordering::Relaxed);
+        let message_type = if method.oneway { MESSAGE_TYPE_ONEWAY } else { MESSAGE_TYPE_CALL };
 
         // ── Phase 1: serialise the call frame in a single writer pass ─────────
         let call_frame: Vec<u8> = {
@@ -216,7 +217,7 @@ impl ThriftClient {
             writer
                 .write_message_begin(&MessageBegin {
                     name: method_name.to_string(),
-                    message_type: MESSAGE_TYPE_CALL,
+                    message_type,
                     seq_id,
                 })
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
@@ -249,8 +250,25 @@ impl ThriftClient {
         let return_type = method.return_type.clone();
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
+        let is_oneway = method.oneway;
 
-        // ── Phase 2: async send + recv without holding the GIL ───────────────
+        // ── Phase 2: async send (and maybe recv) without the GIL ─────────────
+        if is_oneway {
+            py.detach(|| -> Result<(), String> {
+                let mut guard = self.conn.lock().unwrap();
+                let conn = guard.as_mut().ok_or_else(|| {
+                    "ThriftClient is not open; call client.open() first".to_string()
+                })?;
+                self.rt
+                    .block_on(async {
+                        conn_send_frame(&mut conn.writer, &call_frame, transport).await
+                    })
+                    .map_err(|e| format!("I/O error: {}", e))
+            })
+            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
+            return Ok(py.None());
+        }
+
         let reply_payload: Vec<u8> = py
             .detach(|| -> Result<Vec<u8>, String> {
                 let mut guard = self.conn.lock().unwrap();
@@ -264,7 +282,7 @@ impl ThriftClient {
                     })
                     .map_err(|e| format!("I/O error: {}", e))
             })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e))?;
+            .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
 
         // ── Phase 3: decode reply directly into Python objects ────────────────
         let mut cursor = Cursor::new(&reply_payload[..]);

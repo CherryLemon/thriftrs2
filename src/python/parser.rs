@@ -127,6 +127,7 @@ impl ThriftParser {
                             arguments: args,
                             exceptions,
                             arg_field_map,
+                            oneway: m.oneway,
                         }
                     })
                     .collect();
@@ -216,6 +217,7 @@ impl ThriftParser {
 pub enum ProtocolType {
     Binary,
     Compact,
+    #[allow(clippy::upper_case_acronyms)]
     JSON,
 }
 
