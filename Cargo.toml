@@ -16,7 +16,7 @@ name = "thriftrs2"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28.2", features = ["experimental-async"] }
+pyo3 = { version = "0.28.3", features = ["experimental-async"] }
 serde = { version = "1.0", features = ["derive"] }
 nom = "8.0.0"
 serde_json = "1.0"
