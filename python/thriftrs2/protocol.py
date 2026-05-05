@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, Union
 
 from .thriftrs2 import BinaryProtocol, CompactProtocol, ThriftStruct, TransportType, ProtocolType
 
@@ -84,8 +84,10 @@ def deserialize(struct_def: ThriftStruct, data: bytes, proto: ProtocolType = Pro
 
 def dumps(struct_def: ThriftStruct, data: Dict[str, Any]) -> str:
     """Serialize struct data to JSON format"""
-    return struct_def.serialize_with_protocol(data, ProtocolType.JSON)
+    return struct_def.serialize_with_protocol(data, ProtocolType.JSON).decode("utf-8")
 
-def loads(struct_def: ThriftStruct, data: bytes, proto: ProtocolType = ProtocolType.Binary) -> Dict[str, Any]:
-    """Deserialize target protocol data to struct"""
+def loads(struct_def: ThriftStruct, data: Union[str, bytes]) -> Dict[str, Any]:
+    """Deserialize JSON protocol data to struct"""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     return struct_def.deserialize_with_protocol(data, ProtocolType.JSON).to_dict()

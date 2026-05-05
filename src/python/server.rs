@@ -2,27 +2,28 @@
 // server.rs  –  ThriftServer and connection-handling logic (tokio async)
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::protocol::{
-    BinaryProtocolReader, BinaryProtocolWriter, FieldBegin, MessageBegin, TInputProtocol,
-    TOutputProtocol, TType, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY,
+    BinaryProtocolReader, BinaryProtocolWriter, CompactProtocolReader, CompactProtocolWriter,
+    FieldBegin, JSONProtocolReader, JSONProtocolWriter, MessageBegin, TInputProtocol,
+    TOutputProtocol, TType, MESSAGE_TYPE_EXCEPTION, MESSAGE_TYPE_ONEWAY, MESSAGE_TYPE_REPLY,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-use super::parser::ThriftParser;
-use super::serde::{deserialize_rust_struct, thrift_type_to_ttype, write_value_with_structs};
-use super::types::{
-    PyThriftService, ThriftField, ThriftStruct, ThriftStructInstance,
-    TransportType,
+use super::parser::{ProtocolType, ThriftParser};
+use super::serde::{
+    deserialize_rust_struct, thrift_type_to_ttype, thrift_value_to_py, write_value_with_structs,
+    RustStructValue,
 };
+use super::types::{PyThriftMethod, PyThriftService, ThriftStruct, TransportType};
 
 thread_local! {
     static WORKER_PY_ASYNCIO: RefCell<Option<WorkerPythonAsyncio>> = const { RefCell::new(None) };
@@ -39,18 +40,19 @@ impl WorkerPythonAsyncio {
         let loop_thread = std::thread::Builder::new()
             .name("thrift-rs-pyo3-python-loop".to_string())
             .spawn(move || {
-                let locals = match Python::attach(|py| -> PyResult<pyo3_async_runtimes::TaskLocals> {
-                    let asyncio = py.import("asyncio")?;
-                    let event_loop = asyncio.call_method0("new_event_loop")?;
-                    asyncio.call_method1("set_event_loop", (event_loop.clone(),))?;
-                    pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)
-                }) {
-                    Ok(locals) => locals,
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(err.to_string()));
-                        return;
-                    }
-                };
+                let locals =
+                    match Python::attach(|py| -> PyResult<pyo3_async_runtimes::TaskLocals> {
+                        let asyncio = py.import("asyncio")?;
+                        let event_loop = asyncio.call_method0("new_event_loop")?;
+                        asyncio.call_method1("set_event_loop", (event_loop.clone(),))?;
+                        pyo3_async_runtimes::TaskLocals::new(event_loop).copy_context(py)
+                    }) {
+                        Ok(locals) => locals,
+                        Err(err) => {
+                            let _ = ready_tx.send(Err(err.to_string()));
+                            return;
+                        }
+                    };
 
                 if ready_tx.send(Ok(locals.clone())).is_err() {
                     return;
@@ -94,9 +96,7 @@ impl WorkerPythonAsyncio {
         .map_err(|err| err.to_string())?;
 
         if let Some(handle) = self.loop_thread.take() {
-            handle
-                .join()
-                .map_err(format_thread_panic_payload)?;
+            handle.join().map_err(format_thread_panic_payload)?;
         }
 
         Ok(())
@@ -167,12 +167,27 @@ fn format_thread_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>)
     }
 }
 
+struct RegisteredHandler {
+    callable: Py<PyAny>,
+    is_async: bool,
+}
+
+impl RegisteredHandler {
+    fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            callable: self.callable.clone_ref(py),
+            is_async: self.is_async,
+        }
+    }
+}
+
 #[pyclass]
 pub struct ThriftServer {
     service: PyThriftService,
-    handlers: HashMap<String, Py<PyAny>>,
+    handlers: HashMap<String, RegisteredHandler>,
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
+    protocol: ProtocolType,
     workers: usize,
     // Indicates whether the server is currently running (serve/serve_nonblocking).
     running: Arc<AtomicBool>,
@@ -183,13 +198,19 @@ pub struct ThriftServer {
 #[pymethods]
 impl ThriftServer {
     #[new]
-    #[pyo3(signature = (service, transport = TransportType::Framed, workers = 1))]
-    pub fn new(service: PyThriftService, transport: TransportType, workers: usize) -> Self {
+    #[pyo3(signature = (service, transport = TransportType::Framed, workers = 1, protocol = ProtocolType::Binary))]
+    pub fn new(
+        service: PyThriftService,
+        transport: TransportType,
+        workers: usize,
+        protocol: ProtocolType,
+    ) -> Self {
         Self {
             service,
             handlers: HashMap::new(),
             struct_map: Arc::new(HashMap::new()),
             transport,
+            protocol,
             workers,
             running: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(Notify::new()),
@@ -207,6 +228,16 @@ impl ThriftServer {
     }
 
     #[getter]
+    pub fn protocol(&self) -> ProtocolType {
+        self.protocol
+    }
+
+    #[setter]
+    pub fn set_protocol(&mut self, protocol: ProtocolType) {
+        self.protocol = protocol;
+    }
+
+    #[getter]
     pub fn workers(&self) -> usize {
         self.workers
     }
@@ -220,8 +251,24 @@ impl ThriftServer {
         self.struct_map = parser.struct_map();
     }
 
-    pub fn register_handler(&mut self, method_name: &str, handler: Py<PyAny>) {
-        self.handlers.insert(method_name.to_string(), handler);
+    pub fn register_handler(
+        &mut self,
+        py: Python<'_>,
+        method_name: &str,
+        handler: Py<PyAny>,
+    ) -> PyResult<()> {
+        let is_async = py
+            .import("inspect")?
+            .call_method1("iscoroutinefunction", (handler.bind(py),))?
+            .extract()?;
+        self.handlers.insert(
+            method_name.to_string(),
+            RegisteredHandler {
+                callable: handler,
+                is_async,
+            },
+        );
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -237,7 +284,7 @@ impl ThriftServer {
         }
         let addr = format!("{}:{}", host, port);
         let service = Arc::new(self.service.clone());
-        let handlers: Arc<HashMap<String, Py<PyAny>>> = Arc::new(
+        let handlers: Arc<HashMap<String, RegisteredHandler>> = Arc::new(
             self.handlers
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone_ref(py)))
@@ -245,6 +292,7 @@ impl ThriftServer {
         );
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
+        let protocol = self.protocol;
         let n_workers = if self.workers == 0 {
             num_cpus::get().max(2)
         } else {
@@ -255,33 +303,35 @@ impl ThriftServer {
             PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("tokio runtime: {}", e))
         })?;
 
-         // Mark as running and pass a clone into the accept loop so it can
-         // clear the flag if the loop exits.
-         let running = Arc::clone(&self.running);
-         let shutdown = Arc::clone(&self.shutdown);
+        // Mark as running and pass a clone into the accept loop so it can
+        // clear the flag if the loop exits.
+        let running = Arc::clone(&self.running);
+        let shutdown = Arc::clone(&self.shutdown);
 
-         println!(
-             "ThriftServer ({:?}, {} workers) listening on {}",
-             transport, n_workers, addr
-         );
+        println!(
+            "ThriftServer ({:?}, {} workers) listening on {}",
+            transport, n_workers, addr
+        );
 
         std::thread::spawn(move || {
-             rt.block_on(accept_loop(addr, service, handlers, struct_map, transport, running, shutdown));
+            rt.block_on(accept_loop(
+                addr, service, handlers, struct_map, transport, protocol, running, shutdown,
+            ));
         });
 
         Ok(())
     }
 
-     /// Stop the running server (if any). This will notify the accept loop to exit
-     /// and clear the `running` flag.
-     pub fn stop(&self) {
-         // Clear the running flag and notify the runtime to shutdown the accept loop.
-         self.running.store(false, Ordering::SeqCst);
-         self.shutdown.notify_waiters();
-     }
- }
+    /// Stop the running server (if any). This will notify the accept loop to exit
+    /// and clear the `running` flag.
+    pub fn stop(&self) {
+        // Clear the running flag and notify the runtime to shutdown the accept loop.
+        self.running.store(false, Ordering::SeqCst);
+        self.shutdown.notify_waiters();
+    }
+}
 
- // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // Runtime builder
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -308,80 +358,82 @@ fn build_runtime(n_workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn accept_loop(
-     addr: String,
-     service: Arc<PyThriftService>,
-     handlers: Arc<HashMap<String, Py<PyAny>>>,
-     struct_map: Arc<HashMap<String, ThriftStruct>>,
-     transport: TransportType,
-     running: Arc<AtomicBool>,
-     shutdown: Arc<Notify>,
- ) {
-     let listener = match TcpListener::bind(&addr).await {
-         Ok(l) => l,
-         Err(e) => {
-             eprintln!("bind error on {}: {}", addr, e);
-             return;
-         }
-     };
-     running.store(true, Ordering::SeqCst);
-     loop {
-         // Listen for either a shutdown signal (programmatic) or Ctrl+C, or an incoming connection.
-         tokio::select! {
-             _ = shutdown.notified() => {
-                 println!("shutdown requested");
-                 break;
-             }
-             _ = tokio::signal::ctrl_c() => {
-                 println!("received Ctrl+C, shutting down");
-                 break;
-             }
-             accept_res = listener.accept() => {
-                 let (stream, _peer) = match accept_res {
-                     Ok(v) => v,
-                     Err(e) => {
-                         eprintln!("accept error: {}", e);
-                         continue;
-                     }
-                 };
- 
-                 let service = Arc::clone(&service);
-                 let handlers = Arc::clone(&handlers);
-                 let struct_map = Arc::clone(&struct_map);
- 
-                 tokio::spawn(async move {
-                     if let Err(e) =
-                         handle_connection(stream, service, handlers, struct_map, transport).await
-                     {
-                         use std::io::ErrorKind::*;
-                         if e.kind() != UnexpectedEof
-                             && e.kind() != ConnectionReset
-                             && e.kind() != BrokenPipe
-                         {
-                             eprintln!("connection error: {}", e);
-                         }
-                     }
-                 });
-             }
-         }
-     }
- 
-     // If we ever break out of the accept loop, clear the running flag.
-     // (In normal operation the loop is infinite; this ensures correctness
-     // if the loop ever ends.)
-     // Note: unreachable in the current design, but kept for completeness.
-     running.store(false, Ordering::SeqCst);
- }
+    addr: String,
+    service: Arc<PyThriftService>,
+    handlers: Arc<HashMap<String, RegisteredHandler>>,
+    struct_map: Arc<HashMap<String, ThriftStruct>>,
+    transport: TransportType,
+    protocol: ProtocolType,
+    running: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
+) {
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind error on {}: {}", addr, e);
+            return;
+        }
+    };
+    running.store(true, Ordering::SeqCst);
+    loop {
+        // Listen for either a shutdown signal (programmatic) or Ctrl+C, or an incoming connection.
+        tokio::select! {
+            _ = shutdown.notified() => {
+                println!("shutdown requested");
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("received Ctrl+C, shutting down");
+                break;
+            }
+            accept_res = listener.accept() => {
+                let (stream, _peer) = match accept_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("accept error: {}", e);
+                        continue;
+                    }
+                };
 
- // ──────────────────────────────────────────────────────────────────────────────
+                let service = Arc::clone(&service);
+                let handlers = Arc::clone(&handlers);
+                let struct_map = Arc::clone(&struct_map);
+
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_connection(stream, service, handlers, struct_map, transport, protocol).await
+                    {
+                        use std::io::ErrorKind::*;
+                        if e.kind() != UnexpectedEof
+                            && e.kind() != ConnectionReset
+                            && e.kind() != BrokenPipe
+                        {
+                            eprintln!("connection error: {}", e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    // If we ever break out of the accept loop, clear the running flag.
+    // (In normal operation the loop is infinite; this ensures correctness
+    // if the loop ever ends.)
+    // Note: unreachable in the current design, but kept for completeness.
+    running.store(false, Ordering::SeqCst);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Async connection handler
 // ──────────────────────────────────────────────────────────────────────────────
 
 async fn handle_connection(
     stream: TcpStream,
     service: Arc<PyThriftService>,
-    handlers: Arc<HashMap<String, Py<PyAny>>>,
+    handlers: Arc<HashMap<String, RegisteredHandler>>,
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
+    protocol: ProtocolType,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let (read_half, write_half) = stream.into_split();
@@ -389,79 +441,41 @@ async fn handle_connection(
     let mut buf_writer = BufWriter::with_capacity(65536, write_half);
 
     loop {
-        let frame: Vec<u8> = match transport {
-            TransportType::Framed => {
-                let frame_len = match buf_reader.read_i32().await {
-                    Ok(n) if n > 0 => n as usize,
-                    Ok(_) => return Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                    Err(e) => return Err(e),
-                };
-                let mut buf = vec![0u8; frame_len];
-                buf_reader.read_exact(&mut buf).await?;
-                buf
+        let frame = recv_request_frame_async(&mut buf_reader, transport, protocol).await?;
+        if frame.is_empty() {
+            return Ok(());
+        }
+
+        let mut cursor = Cursor::new(&frame[..]);
+        let (msg_begin, method_and_args) = match protocol {
+            ProtocolType::Binary => {
+                let mut reader = BinaryProtocolReader::new(&mut cursor);
+                decode_request(&mut reader, &service, &struct_map)?
             }
-            TransportType::Buffered => {
-                let mut hdr = [0u8; 4];
-                match buf_reader.read_exact(&mut hdr).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                    Err(e) => return Err(e),
-                }
-                let mut name_len_bytes = [0u8; 4];
-                buf_reader.read_exact(&mut name_len_bytes).await?;
-                let name_len = i32::from_be_bytes(name_len_bytes) as usize;
-                let mut name_buf = vec![0u8; name_len];
-                buf_reader.read_exact(&mut name_buf).await?;
-                let mut seq_id_bytes = [0u8; 4];
-                buf_reader.read_exact(&mut seq_id_bytes).await?;
-
-                let mut body: Vec<u8> = Vec::with_capacity(256);
-                read_buffered_struct_body_async(&mut buf_reader, &mut body).await?;
-
-                let mut frame =
-                    Vec::with_capacity(4 + 4 + name_len + 4 + body.len());
-                frame.extend_from_slice(&hdr);
-                frame.extend_from_slice(&name_len_bytes);
-                frame.extend_from_slice(&name_buf);
-                frame.extend_from_slice(&seq_id_bytes);
-                frame.extend_from_slice(&body);
-                frame
+            ProtocolType::Compact => {
+                let mut reader = CompactProtocolReader::new(&mut cursor);
+                decode_request(&mut reader, &service, &struct_map)?
+            }
+            ProtocolType::JSON => {
+                let mut reader = JSONProtocolReader::new(&mut cursor);
+                decode_request(&mut reader, &service, &struct_map)?
             }
         };
 
-        let mut cursor = Cursor::new(&frame[..]);
-        let mut reader = BinaryProtocolReader::new(&mut cursor);
-        let msg_begin = reader
-            .read_message_begin()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let method_def = service.methods.iter().find(|m| m.name == msg_begin.name);
-
-        let response_payload = match method_def {
+        let response_payload = match method_and_args {
             None => build_exception_reply(
+                protocol,
                 &msg_begin.name,
                 msg_begin.seq_id,
                 1,
                 &format!("Unknown method: {}", msg_begin.name),
             ),
-            Some(method) => {
-                let args_rust = deserialize_rust_struct(
-                    &mut reader,
-                    &method.arguments,
-                    &method.arg_field_map,
-                    &struct_map,
-                )
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-                })?;
-
-                let args_struct_name = format!("{}_args", msg_begin.name);
-                let args_field_names = args_rust.field_names;
+            Some((method, args_rust)) => {
                 let args_values = args_rust.values;
 
                 if !handlers.contains_key(&msg_begin.name) {
                     let payload = build_exception_reply(
+                        protocol,
                         &msg_begin.name,
                         msg_begin.seq_id,
                         1,
@@ -478,8 +492,6 @@ async fn handle_connection(
                 let method_name = msg_begin.name.clone();
                 let seq_id = msg_begin.seq_id;
 
-                // Detect whether the handler is a coroutine function (async def)
-                // and build kwargs — all done while holding the GIL briefly.
                 enum CallOutcome {
                     /// Sync handler returned a value directly.
                     Sync(Vec<u8>),
@@ -487,90 +499,54 @@ async fn handle_connection(
                     Async(Py<PyAny>),
                 }
 
-                let outcome: Result<CallOutcome, String> =
-                    tokio::task::spawn_blocking({
-                        let method = method.clone();
-                        let struct_map2 = Arc::clone(&struct_map2);
-                        let handlers2 = Arc::clone(&handlers2);
-                        let method_name = method_name.clone();
-                        let args_struct_name = args_struct_name.clone();
-                        let args_field_names = args_field_names.clone();
-                        let args_values = args_values.clone();
-                        move || {
-                            Python::attach(|py| {
-                                let handler = handlers2
-                                    .get(&method_name)
-                                    .expect("handler checked above")
-                                    .clone_ref(py);
+                let outcome: Result<CallOutcome, String> = tokio::task::spawn_blocking({
+                    let method = method.clone();
+                    let struct_map2 = Arc::clone(&struct_map2);
+                    let handlers2 = Arc::clone(&handlers2);
+                    let method_name = method_name.clone();
+                    let args_values = args_values;
+                    move || {
+                        Python::attach(|py| {
+                            let handler_entry =
+                                handlers2.get(&method_name).expect("handler checked above");
+                            let handler = handler_entry.callable.clone_ref(py);
+                            let is_async_fn = handler_entry.is_async;
 
-                                // Detect async def *before* calling.
-                                let is_async_fn: bool = py
-                                    .import("inspect")?
-                                    .call_method1(
-                                        "iscoroutinefunction",
-                                        (handler.bind(py),),
-                                    )?
-                                    .extract()?;
-
-                                let schema: Arc<HashMap<String, ThriftField>> =
-                                    Arc::new(
-                                        method
-                                            .arguments
-                                            .iter()
-                                            .map(|f| (f.name.clone(), f.clone()))
-                                            .collect(),
-                                    );
-                                let args_instance = ThriftStructInstance::from_rust(
-                                    args_struct_name,
-                                    Arc::new(args_field_names),
-                                    args_values,
-                                    schema,
-                                    Arc::clone(&struct_map2),
-                                );
-                                let py_args = Bound::new(py, args_instance)?;
-
-                                let kwargs = PyDict::new(py);
-                                let mut inst_borrow = py_args.borrow_mut();
-                                let field_names: Vec<String> =
-                                    inst_borrow.field_names.as_ref().clone();
-                                for name in &field_names {
-                                    let val = inst_borrow
-                                        .get_field(py, name)
-                                        .map(|v| v.unbind())
-                                        .unwrap_or_else(|| py.None());
-                                    kwargs.set_item(name, val)?;
-                                }
-                                drop(inst_borrow);
-
-                                let call_result =
-                                    handler.call(py, (), Some(&kwargs))?;
-
-                                if is_async_fn {
-                                    // Return the coroutine object; we'll drive it
-                                    // natively on the tokio task via pyo3-async-runtimes.
-                                    Ok::<CallOutcome, PyErr>(CallOutcome::Async(
-                                        call_result,
-                                    ))
+                            let kwargs = PyDict::new(py);
+                            for field in &method.arguments {
+                                if let Some(value) = args_values.get(&field.name) {
+                                    let py_value = thrift_value_to_py(value, py, &struct_map2)?;
+                                    kwargs.set_item(&field.name, py_value.bind(py))?;
                                 } else {
-                                    // Sync handler: build reply immediately.
-                                    let reply_body = build_reply_body(
-                                        py,
-                                        &method.return_type,
-                                        call_result.bind(py),
-                                        &struct_map2,
-                                    )?;
-                                    Ok(CallOutcome::Sync(build_reply_frame(
-                                        &method_name,
-                                        seq_id,
-                                        &reply_body,
-                                    )))
+                                    kwargs.set_item(&field.name, py.None())?;
                                 }
-                            })
-                            .map_err(|e: PyErr| e.to_string())
-                        }
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(e.to_string()));
+                            }
+
+                            let call_result = handler.call(py, (), Some(&kwargs))?;
+
+                            if is_async_fn {
+                                // Return the coroutine object; we'll drive it
+                                // natively on the tokio task via pyo3-async-runtimes.
+                                Ok::<CallOutcome, PyErr>(CallOutcome::Async(call_result))
+                            } else {
+                                // Sync handler: build reply immediately.
+                                let reply_body = build_reply_body(
+                                    py,
+                                    &method.return_type,
+                                    call_result.bind(py),
+                                    &struct_map2,
+                                    protocol,
+                                    &method_name,
+                                    seq_id,
+                                )?;
+                                Ok(CallOutcome::Sync(reply_body))
+                            }
+                        })
+                        .map_err(|e: PyErr| e.to_string())
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
 
                 let result: Result<Vec<u8>, String> = match outcome {
                     Err(e) => Err(e),
@@ -590,24 +566,20 @@ async fn handle_connection(
                                 Ok(fut) => {
                                     let py_result = fut.await;
                                     Python::attach(|py| {
-                                        py_result
-                                            .map_err(|e: PyErr| e.to_string())
-                                            .and_then(|py_val| {
+                                        py_result.map_err(|e: PyErr| e.to_string()).and_then(
+                                            |py_val| {
                                                 build_reply_body(
                                                     py,
                                                     &method.return_type,
                                                     py_val.bind(py),
                                                     &struct_map2,
+                                                    protocol,
+                                                    &method_name,
+                                                    seq_id,
                                                 )
                                                 .map_err(|e: PyErr| e.to_string())
-                                                .map(|body| {
-                                                    build_reply_frame(
-                                                        &method_name,
-                                                        seq_id,
-                                                        &body,
-                                                    )
-                                                })
-                                            })
+                                            },
+                                        )
                                     })
                                 }
                             }
@@ -617,9 +589,13 @@ async fn handle_connection(
 
                 match result {
                     Ok(frame) => frame,
-                    Err(err_msg) => {
-                        build_exception_reply(&msg_begin.name, msg_begin.seq_id, 6, &err_msg)
-                    }
+                    Err(err_msg) => build_exception_reply(
+                        protocol,
+                        &msg_begin.name,
+                        msg_begin.seq_id,
+                        6,
+                        &err_msg,
+                    ),
                 }
             }
         };
@@ -630,9 +606,155 @@ async fn handle_connection(
     }
 }
 
+fn decode_request<P: TInputProtocol>(
+    reader: &mut P,
+    service: &PyThriftService,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> std::io::Result<(MessageBegin, Option<(PyThriftMethod, RustStructValue)>)> {
+    let msg_begin = reader.read_message_begin()?;
+    let method = service
+        .methods
+        .iter()
+        .find(|m| m.name == msg_begin.name)
+        .cloned();
+
+    let method_and_args = if let Some(method) = method {
+        let args =
+            deserialize_rust_struct(reader, &method.arguments, &method.arg_field_map, struct_map)?;
+        Some((method, args))
+    } else {
+        None
+    };
+
+    reader.read_message_end()?;
+    Ok((msg_begin, method_and_args))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Async framing helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+async fn recv_request_frame_async<R>(
+    reader: &mut R,
+    transport: TransportType,
+    protocol: ProtocolType,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin,
+{
+    match transport {
+        TransportType::Framed => {
+            let frame_len = match reader.read_i32().await {
+                Ok(n) if n > 0 => n as usize,
+                Ok(_) => return Ok(Vec::new()),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+            let mut buf = vec![0u8; frame_len];
+            reader.read_exact(&mut buf).await?;
+            Ok(buf)
+        }
+        TransportType::Buffered if protocol == ProtocolType::JSON => {
+            read_json_value_async(reader).await
+        }
+        TransportType::Buffered if protocol == ProtocolType::Binary => {
+            let mut hdr = [0u8; 4];
+            match reader.read_exact(&mut hdr).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            }
+            let mut name_len_bytes = [0u8; 4];
+            reader.read_exact(&mut name_len_bytes).await?;
+            let name_len = i32::from_be_bytes(name_len_bytes) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            reader.read_exact(&mut name_buf).await?;
+            let mut seq_id_bytes = [0u8; 4];
+            reader.read_exact(&mut seq_id_bytes).await?;
+
+            let mut body: Vec<u8> = Vec::with_capacity(256);
+            read_buffered_struct_body_async(reader, &mut body).await?;
+
+            let mut frame = Vec::with_capacity(4 + 4 + name_len + 4 + body.len());
+            frame.extend_from_slice(&hdr);
+            frame.extend_from_slice(&name_len_bytes);
+            frame.extend_from_slice(&name_buf);
+            frame.extend_from_slice(&seq_id_bytes);
+            frame.extend_from_slice(&body);
+            Ok(frame)
+        }
+        TransportType::Buffered => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "buffered RPC transport currently supports Binary and JSON protocols",
+        )),
+    }
+}
+
+async fn read_json_value_async<R>(reader: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut out = Vec::with_capacity(256);
+    let mut started = false;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    loop {
+        let byte = match reader.read_u8().await {
+            Ok(byte) => byte,
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && !started => {
+                return Ok(Vec::new());
+            }
+            Err(err) => return Err(err),
+        };
+
+        if !started {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            match byte {
+                b'[' | b'{' => {
+                    started = true;
+                    depth = 1;
+                    out.push(byte);
+                    continue;
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "expected JSON object or array at start of buffered message",
+                    ));
+                }
+            }
+        }
+
+        out.push(byte);
+
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 async fn send_response_async<W>(
     writer: &mut W,
@@ -644,9 +766,7 @@ where
 {
     match transport {
         TransportType::Framed => {
-            writer
-                .write_i32(payload.len() as i32)
-                .await?;
+            writer.write_i32(payload.len() as i32).await?;
             writer.write_all(payload).await?;
         }
         TransportType::Buffered => {
@@ -778,9 +898,64 @@ fn build_reply_body(
     return_type: &ThriftType,
     value: &Bound<'_, PyAny>,
     struct_map: &HashMap<String, ThriftStruct>,
+    protocol: ProtocolType,
+    method_name: &str,
+    seq_id: i32,
 ) -> PyResult<Vec<u8>> {
     let mut buf = Vec::with_capacity(64);
-    let mut writer = BinaryProtocolWriter::new(&mut buf);
+    match protocol {
+        ProtocolType::Binary => {
+            let mut writer = BinaryProtocolWriter::new(&mut buf);
+            write_reply_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                return_type,
+                value,
+                struct_map,
+            )?;
+        }
+        ProtocolType::Compact => {
+            let mut writer = CompactProtocolWriter::new(&mut buf);
+            write_reply_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                return_type,
+                value,
+                struct_map,
+            )?;
+        }
+        ProtocolType::JSON => {
+            let mut writer = JSONProtocolWriter::new(&mut buf);
+            write_reply_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                return_type,
+                value,
+                struct_map,
+            )?;
+        }
+    }
+    Ok(buf)
+}
+
+fn write_reply_frame<P: TOutputProtocol>(
+    writer: &mut P,
+    method_name: &str,
+    seq_id: i32,
+    return_type: &ThriftType,
+    value: &Bound<'_, PyAny>,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> PyResult<()> {
+    writer
+        .write_message_begin(&MessageBegin {
+            name: method_name.to_string(),
+            message_type: MESSAGE_TYPE_REPLY,
+            seq_id,
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
 
     match return_type {
         ThriftType::Struct(name) if name == "void" => {}
@@ -793,60 +968,76 @@ fn build_reply_body(
             writer
                 .write_field_begin(&field_begin)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            write_value_with_structs(&mut writer, return_type, value, struct_map)?;
+            write_value_with_structs(writer, return_type, value, struct_map)?;
+            writer
+                .write_field_end()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
     }
 
     writer
         .write_field_stop()
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-    Ok(buf)
+    writer
+        .write_message_end()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    Ok(())
 }
 
-fn build_reply_frame(method_name: &str, seq_id: i32, body: &[u8]) -> Vec<u8> {
-    use crate::protocol::MESSAGE_TYPE_REPLY;
-    let mut buf = Vec::with_capacity(32 + body.len());
-    {
-        let mut writer = BinaryProtocolWriter::new(&mut buf);
-        writer
-            .write_message_begin(&MessageBegin {
-                name: method_name.to_string(),
-                message_type: MESSAGE_TYPE_REPLY,
-                seq_id,
-            })
-            .unwrap();
-    }
-    buf.extend_from_slice(body);
-    buf
-}
-
-fn build_exception_reply(method_name: &str, seq_id: i32, ex_type: i32, message: &str) -> Vec<u8> {
+fn build_exception_reply(
+    protocol: ProtocolType,
+    method_name: &str,
+    seq_id: i32,
+    ex_type: i32,
+    message: &str,
+) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
-    {
-        let mut writer = BinaryProtocolWriter::new(&mut buf);
-        writer
-            .write_message_begin(&MessageBegin {
-                name: method_name.to_string(),
-                message_type: MESSAGE_TYPE_EXCEPTION,
-                seq_id,
-            })
-            .unwrap();
-        let msg_field = FieldBegin {
-            name: None,
-            field_type: TType::String,
-            id: 1,
-        };
-        writer.write_field_begin(&msg_field).unwrap();
-        writer.write_string(message).unwrap();
-        let type_field = FieldBegin {
-            name: None,
-            field_type: TType::I32,
-            id: 2,
-        };
-        writer.write_field_begin(&type_field).unwrap();
-        writer.write_i32(ex_type).unwrap();
-        writer.write_field_stop().unwrap();
+    match protocol {
+        ProtocolType::Binary => {
+            let mut writer = BinaryProtocolWriter::new(&mut buf);
+            write_exception_reply(&mut writer, method_name, seq_id, ex_type, message).unwrap();
+        }
+        ProtocolType::Compact => {
+            let mut writer = CompactProtocolWriter::new(&mut buf);
+            write_exception_reply(&mut writer, method_name, seq_id, ex_type, message).unwrap();
+        }
+        ProtocolType::JSON => {
+            let mut writer = JSONProtocolWriter::new(&mut buf);
+            write_exception_reply(&mut writer, method_name, seq_id, ex_type, message).unwrap();
+        }
     }
     buf
 }
 
+fn write_exception_reply<P: TOutputProtocol>(
+    writer: &mut P,
+    method_name: &str,
+    seq_id: i32,
+    ex_type: i32,
+    message: &str,
+) -> std::io::Result<()> {
+    writer.write_message_begin(&MessageBegin {
+        name: method_name.to_string(),
+        message_type: MESSAGE_TYPE_EXCEPTION,
+        seq_id,
+    })?;
+    let msg_field = FieldBegin {
+        name: None,
+        field_type: TType::String,
+        id: 1,
+    };
+    writer.write_field_begin(&msg_field)?;
+    writer.write_string(message)?;
+    writer.write_field_end()?;
+    let type_field = FieldBegin {
+        name: None,
+        field_type: TType::I32,
+        id: 2,
+    };
+    writer.write_field_begin(&type_field)?;
+    writer.write_i32(ex_type)?;
+    writer.write_field_end()?;
+    writer.write_field_stop()?;
+    writer.write_message_end()?;
+    Ok(())
+}

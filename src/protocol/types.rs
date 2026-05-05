@@ -24,20 +24,20 @@ pub enum TType {
 impl TType {
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0  => Some(TType::Stop),
-            1  => Some(TType::Void),
-            2  => Some(TType::Bool),
-            3  => Some(TType::Byte),
-            4  => Some(TType::Double),
-            6  => Some(TType::I16),
-            8  => Some(TType::I32),
+            0 => Some(TType::Stop),
+            1 => Some(TType::Void),
+            2 => Some(TType::Bool),
+            3 => Some(TType::Byte),
+            4 => Some(TType::Double),
+            6 => Some(TType::I16),
+            8 => Some(TType::I32),
             10 => Some(TType::I64),
             11 => Some(TType::String),
             12 => Some(TType::Struct),
             13 => Some(TType::Map),
             14 => Some(TType::Set),
             15 => Some(TType::List),
-            _  => None,
+            _ => None,
         }
     }
 }
@@ -129,12 +129,6 @@ pub trait TInputProtocol {
     fn read_list_end(&mut self) -> Result<(), ProtocolError>;
     fn read_set_begin(&mut self) -> Result<SetBegin, ProtocolError>;
     fn read_set_end(&mut self) -> Result<(), ProtocolError>;
-
-    // Raw reads for skip_value — no allocation, no Python involvement.
-    fn read_u8_raw(&mut self) -> Result<u8, ProtocolError>;
-    fn read_i16_raw(&mut self) -> Result<i16, ProtocolError>;
-    fn read_i32_raw(&mut self) -> Result<i32, ProtocolError>;
-    fn read_i64_raw(&mut self) -> Result<i64, ProtocolError>;
 }
 
 pub trait TOutputProtocol {

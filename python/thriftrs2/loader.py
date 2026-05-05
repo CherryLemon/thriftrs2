@@ -1,9 +1,13 @@
 import asyncio
 import os
+import re
 import threading
 from typing import Any, Optional
 
-from .thriftrs2 import ThriftParser, ThriftClient, ThriftServer, TransportType
+from .thriftrs2 import ProtocolType, ThriftParser, ThriftClient, ThriftServer, TransportType
+
+
+_INCLUDE_RE = re.compile(r'^\s*include\s+"([^"]+)"', re.MULTILINE)
 
 
 class ThriftModule:
@@ -23,14 +27,13 @@ class ThriftModule:
             struct_def = self._parser.get_struct(struct_name)
             if struct_def:
                 self._structs[struct_name] = struct_def
-                # Make structs accessible as attributes
                 setattr(self, struct_name, struct_def)
-        service_name = self._parser.list_services()
-        for service_name in service_name:
+
+        service_names = self._parser.list_services()
+        for service_name in service_names:
             service_def = self._parser.get_service(service_name)
             if service_def:
                 self._services[service_name] = service_def
-                # Services are not instantiated yet, so we don't set them as attributes here
 
     def __getattr__(self, name: str):
         if name in self._structs:
@@ -47,6 +50,43 @@ class ThriftService:
 
     def __repr__(self):
         return f"<ThriftService {self.service_def}>"
+
+
+def _resolve_include(include_name: str, base_dir: str, include_dirs: Optional[list]) -> str:
+    if os.path.isabs(include_name) and os.path.exists(include_name):
+        return include_name
+
+    search_dirs = [base_dir]
+    if include_dirs:
+        search_dirs.extend(include_dirs)
+
+    for directory in search_dirs:
+        candidate = os.path.abspath(os.path.join(directory, include_name))
+        if os.path.exists(candidate):
+            return candidate
+
+    searched = ", ".join(os.path.abspath(path) for path in search_dirs)
+    raise FileNotFoundError(f"Included thrift file not found: {include_name} (searched: {searched})")
+
+
+def _read_thrift_with_includes(thrift_file: str, include_dirs: Optional[list], seen: set[str]) -> str:
+    thrift_file = os.path.abspath(thrift_file)
+    if thrift_file in seen:
+        return ""
+    seen.add(thrift_file)
+
+    with open(thrift_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    base_dir = os.path.dirname(thrift_file)
+    chunks = []
+    for include_name in _INCLUDE_RE.findall(content):
+        include_path = _resolve_include(include_name, base_dir, include_dirs)
+        included_content = _read_thrift_with_includes(include_path, include_dirs, seen)
+        if included_content:
+            chunks.append(included_content)
+    chunks.append(content)
+    return "\n".join(chunks)
 
 
 def load(thrift_file: str, module_name: Optional[str] = None, include_dirs: Optional[list] = None) -> ThriftModule:
@@ -67,8 +107,7 @@ def load(thrift_file: str, module_name: Optional[str] = None, include_dirs: Opti
     if module_name is None:
         module_name = os.path.splitext(os.path.basename(thrift_file))[0]
 
-    with open(thrift_file, 'r', encoding='utf-8') as f:
-        content = f.read()
+    content = _read_thrift_with_includes(thrift_file, include_dirs, set())
 
     parser = ThriftParser()
     parser.parse(content)
@@ -85,10 +124,11 @@ def load_fp(fp, module_name: str, **kwargs) -> ThriftModule:
 
 
 def make_client(
-        service: ThriftService,
-        host: str,
-        port: int,
-        transport: TransportType = TransportType.Buffered,
+    service: ThriftService,
+    host: str,
+    port: int,
+    transport: TransportType = TransportType.Buffered,
+    protocol: ProtocolType = ProtocolType.Binary,
 ) -> ThriftClient:
     """
     Create a connected :class:`ThriftClient`.
@@ -97,10 +137,8 @@ def make_client(
 
     Parameters
     ----------
-    service : ThriftModule or PyThriftService
-        Either the :class:`ThriftModule` returned by :func:`load` (recommended),
-        or a raw ``PyThriftService`` obtained from
-        ``thrift_module._parser.get_service("ServiceName")``.
+    service : ThriftService
+        Service attribute from the :class:`ThriftModule` returned by :func:`load`.
     host : str
         Remote host to connect to.
     port : int
@@ -108,30 +146,39 @@ def make_client(
     transport : TransportType
         ``TransportType.Framed`` or ``TransportType.Buffered``
         (default ``Buffered``).
+    protocol : ProtocolType
+        ``ProtocolType.Binary``, ``ProtocolType.Compact`` or ``ProtocolType.JSON``
+        (default ``Binary``). Client and server must use the same protocol.
 
     Returns
     -------
     ThriftClient
         An already-connected client instance.
     """
-    client = ThriftClient(service.service_def, host, port, transport)
+    client = ThriftClient(service.service_def, host, port, transport, protocol)
     client.set_parser(service.parser)
     client.open()
     return client
 
 
 class ThriftServerWrapper:
-    def __init__(self, service: ThriftService, handler, transport: TransportType, workers: int = 1):
-        server = self._server = ThriftServer(service.service_def, transport, workers)
+    def __init__(
+        self,
+        service: ThriftService,
+        handler,
+        transport: TransportType,
+        workers: int = 1,
+        protocol: ProtocolType = ProtocolType.Binary,
+    ):
+        server = self._server = ThriftServer(service.service_def, transport, workers, protocol)
         self._server.set_parser(service.parser)
-        # Accept either a plain dict or an object with handler methods.
         if isinstance(handler, dict):
             for method_name, func in handler.items():
                 server.register_handler(method_name, func)
         else:
             for attr_name in dir(handler):
                 if service.service_def.get_method(attr_name) is None:
-                    continue  # skip non-service methods
+                    continue
                 func = getattr(handler, attr_name)
                 server.register_handler(attr_name, func)
 
@@ -143,7 +190,6 @@ class ThriftServerWrapper:
     def serve_forever(self, host, port, blocking=True):
         async def serve():
             self._server.serve(host, port)
-            # ping the host + port to ensure the server is up before returning
             while not self._server.is_running():
                 await asyncio.sleep(0.1)
             print('server started and listening on {}:{}'.format(host, port))
@@ -157,47 +203,19 @@ class ThriftServerWrapper:
         if blocking:
             self._waiter.result()
 
+
 def make_server(
-        service: ThriftService,
-        handler: Any,
-        transport: TransportType = TransportType.Buffered,
-        *,
-        workers: int = 1
+    service: ThriftService,
+    handler: Any,
+    transport: TransportType = TransportType.Buffered,
+    *,
+    workers: int = 1,
+    protocol: ProtocolType = ProtocolType.Binary,
 ) -> ThriftServerWrapper:
     """
-    Create a :class:`ThriftServer`, register *handler* methods, and start
-    serving.
+    Create a :class:`ThriftServer`, register *handler* methods, and start serving.
 
     Analogous to ``thriftpy2.rpc.make_server``.
-
-    The *handler* object is inspected: every public method whose name matches
-    a method declared in the service is registered automatically.  You can
-    also pass a plain ``dict`` mapping method names to callables.
-
-    Parameters
-    ----------
-    service : ThriftService
-        Either the :class:`ThriftModule` returned by :func:`load` (recommended),
-        or a raw ``PyThriftService`` obtained from
-        ``thrift_module._parser.get_service("ServiceName")``.
-    handler : object or dict
-        Object whose methods (or dict whose values) implement the service
-        methods.
-    host : str
-        Address to bind to (default ``"127.0.0.1"``).
-    port : int
-        Port to listen on (default ``9090``).
-    transport : TransportType
-        ``TransportType.Framed`` or ``TransportType.Buffered``
-        (default ``Buffered``).
-    workers : int
-        Number of worker threads (default ``1``).
-
-    Returns
-    -------
-    ThriftServerWrapper
-        The server is already serving (this call blocks until the server
-        is stopped).
     """
-    server = ThriftServerWrapper(service, handler, transport, workers)
+    server = ThriftServerWrapper(service, handler, transport, workers, protocol)
     return server

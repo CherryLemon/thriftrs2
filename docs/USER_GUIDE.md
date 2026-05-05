@@ -93,10 +93,32 @@ text = dumps(mod.User, user)
 round_trip = loads(mod.User, text)
 ```
 
+RPC helpers also accept `protocol=...`. The client and server must agree on
+the same protocol:
+
+```python
+from thriftrs2 import ProtocolType, TBufferedTransport, make_client, make_server
+
+server = make_server(
+    mod.UserService,
+    Handler(),
+    transport=TBufferedTransport.transport_type,
+    protocol=ProtocolType.JSON,
+)
+
+client = make_client(
+    mod.UserService,
+    "127.0.0.1",
+    9090,
+    TBufferedTransport.transport_type,
+    protocol=ProtocolType.JSON,
+)
+```
+
 ## 6. Running a Thrift client
 
 ```python
-from thriftrs2 import load, make_client, TBufferedTransport
+from thriftrs2 import load, make_client, TBufferedTransport, ProtocolType
 
 mod = load("examples/example.thrift")
 
@@ -105,6 +127,7 @@ with make_client(
     "127.0.0.1",
     9090,
     TBufferedTransport.transport_type,
+    protocol=ProtocolType.Binary,
 ) as client:
     result = client.call("get_user", user_id=1)
     print(result)
@@ -113,7 +136,7 @@ with make_client(
 ## 7. Running a Thrift server
 
 ```python
-from thriftrs2 import load, make_server, TBufferedTransport
+from thriftrs2 import load, make_server, TBufferedTransport, ProtocolType
 
 mod = load("examples/example.thrift")
 
@@ -131,6 +154,7 @@ server = make_server(
     mod.UserService,
     Handler(),
     transport=TBufferedTransport.transport_type,
+    protocol=ProtocolType.Binary,
     workers=4,
 )
 server.serve_forever("127.0.0.1", 9090)

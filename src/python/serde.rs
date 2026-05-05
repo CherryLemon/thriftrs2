@@ -10,9 +10,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::types::{
-    ThriftField, ThriftStruct, ThriftStructInstance,
-};
+use super::types::{ThriftField, ThriftStruct, ThriftStructInstance};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // RustStructValue  –  GIL-free pure-Rust representation used during deserialization.
@@ -130,6 +128,15 @@ pub(crate) fn serialize_struct_fields<P: TOutputProtocol>(
 ) -> PyResult<()> {
     for field in fields {
         if let Some(value) = data.get_item(&field.name)? {
+            if value.is_none() {
+                if field.required {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                        "Required field '{}' cannot be None",
+                        field.name
+                    )));
+                }
+                continue;
+            }
             let field_begin = FieldBegin {
                 name: None,
                 field_type: thrift_type_to_ttype(&field.field_type),
@@ -217,6 +224,15 @@ pub(crate) fn write_value_with_structs<'py, P: TOutputProtocol>(
             for item in list.iter() {
                 write_value_with_structs(writer, elem_type, &item, struct_map)?;
             }
+            if matches!(thrift_type, ThriftType::List(_)) {
+                writer
+                    .write_list_end()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            } else {
+                writer
+                    .write_set_end()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            }
         }
         ThriftType::Map(key_type, val_type) => {
             let dict = value.cast::<PyDict>()?;
@@ -225,35 +241,29 @@ pub(crate) fn write_value_with_structs<'py, P: TOutputProtocol>(
                 value_type: thrift_type_to_ttype(val_type),
                 size: dict.len() as i32,
             };
-            writer.write_map_begin(&mb).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-            })?;
+            writer
+                .write_map_begin(&mb)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             for (k, v) in dict.iter() {
                 write_value_with_structs(writer, key_type, &k, struct_map)?;
                 write_value_with_structs(writer, val_type, &v, struct_map)?;
             }
-            writer.write_map_end().map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-            })?;
+            writer
+                .write_map_end()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         }
         ThriftType::Struct(name) => {
             if let Some(target_struct) = struct_map.get(name) {
-                writer.write_struct_begin(name).map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-                })?;
-                serialize_struct_any(
-                    writer,
-                    &target_struct.fields,
-                    value,
-                    struct_map,
-                    value.py(),
-                )?;
-                writer.write_field_stop().map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-                })?;
-                writer.write_struct_end().map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-                })?;
+                writer
+                    .write_struct_begin(name)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                serialize_struct_any(writer, &target_struct.fields, value, struct_map, value.py())?;
+                writer
+                    .write_field_stop()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                writer
+                    .write_struct_end()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             } else {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                     "Unknown struct in schema: {}",
@@ -292,6 +302,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
             for item in items {
                 write_thrift_value(writer, item, struct_map)?;
             }
+            writer.write_list_end()?;
             Ok(())
         }
         ThriftValue::Set(items) => {
@@ -306,6 +317,7 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
             for item in items {
                 write_thrift_value(writer, item, struct_map)?;
             }
+            writer.write_set_end()?;
             Ok(())
         }
         ThriftValue::Map(pairs) => {
@@ -322,9 +334,12 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                 write_thrift_value(writer, k, struct_map)?;
                 write_thrift_value(writer, v, struct_map)?;
             }
+            writer.write_map_end()?;
             Ok(())
         }
         ThriftValue::Struct { name, fields } => {
+            writer.write_struct_begin(name.as_deref().unwrap_or(""))?;
+
             let ordered_fields: Vec<(&String, &ThriftValue)> = if let Some(sname) = name {
                 if let Some(def) = struct_map.get(sname) {
                     def.fields
@@ -353,8 +368,10 @@ pub(crate) fn write_thrift_value<P: TOutputProtocol>(
                 };
                 writer.write_field_begin(&field_begin)?;
                 write_thrift_value(writer, fval, struct_map)?;
+                writer.write_field_end()?;
             }
             writer.write_field_stop()?;
+            writer.write_struct_end()?;
             Ok(())
         }
     }
@@ -402,9 +419,13 @@ pub(crate) fn deserialize_struct_fields_as_instance<'py, P: TInputProtocol>(
     struct_def: &ThriftStruct,
     py: Python<'py>,
 ) -> PyResult<Bound<'py, ThriftStructInstance>> {
-    let mut rust_val =
-        deserialize_rust_struct(reader, &struct_def.fields, &struct_def.field_map, &struct_def.struct_map)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
+    let mut rust_val = deserialize_rust_struct(
+        reader,
+        &struct_def.fields,
+        &struct_def.field_map,
+        &struct_def.struct_map,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e)))?;
     rust_val.struct_name = struct_def.name.clone();
     let instance = ThriftStructInstance::from_rust(
         rust_val.struct_name,
@@ -424,14 +445,30 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
     struct_map: &HashMap<String, ThriftStruct>,
 ) -> std::io::Result<ThriftValue> {
     match thrift_type {
-        ThriftType::Bool => Ok(ThriftValue::Bool(reader.read_bool().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::Byte => Ok(ThriftValue::Byte(reader.read_byte().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::I16 => Ok(ThriftValue::I16(reader.read_i16().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::I32 => Ok(ThriftValue::I32(reader.read_i32().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::I64 => Ok(ThriftValue::I64(reader.read_i64().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::Double => Ok(ThriftValue::Double(reader.read_double().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::String => Ok(ThriftValue::String(reader.read_string().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
-        ThriftType::Binary => Ok(ThriftValue::Binary(reader.read_binary().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?)),
+        ThriftType::Bool => Ok(ThriftValue::Bool(reader.read_bool().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::Byte => Ok(ThriftValue::Byte(reader.read_byte().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::I16 => Ok(ThriftValue::I16(reader.read_i16().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::I32 => Ok(ThriftValue::I32(reader.read_i32().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::I64 => Ok(ThriftValue::I64(reader.read_i64().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::Double => Ok(ThriftValue::Double(reader.read_double().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::String => Ok(ThriftValue::String(reader.read_string().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
+        ThriftType::Binary => Ok(ThriftValue::Binary(reader.read_binary().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+        })?)),
         ThriftType::List(elem_type) => {
             let lb = reader
                 .read_list_begin()
@@ -440,7 +477,9 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
             for _ in 0..lb.size {
                 items.push(read_rust_value(reader, elem_type, struct_map)?);
             }
-            reader.read_list_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            reader
+                .read_list_end()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(ThriftValue::List(items))
         }
         ThriftType::Set(elem_type) => {
@@ -451,7 +490,9 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
             for _ in 0..sb.size {
                 items.push(read_rust_value(reader, elem_type, struct_map)?);
             }
-            reader.read_set_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            reader
+                .read_set_end()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(ThriftValue::Set(items))
         }
         ThriftType::Map(key_type, val_type) => {
@@ -464,7 +505,9 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
                 let v = read_rust_value(reader, val_type, struct_map)?;
                 pairs.push((k, v));
             }
-            reader.read_map_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            reader
+                .read_map_end()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(ThriftValue::Map(pairs))
         }
         ThriftType::Struct(struct_name) => {
@@ -474,9 +517,18 @@ pub(crate) fn read_rust_value<P: TInputProtocol>(
                     format!("Unknown struct type: {}", struct_name),
                 )
             })?;
-            reader.read_struct_begin().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            let nested = deserialize_rust_struct(reader, &struct_def.fields, &struct_def.field_map, struct_map)?;
-            reader.read_struct_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            reader
+                .read_struct_begin()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            let nested = deserialize_rust_struct(
+                reader,
+                &struct_def.fields,
+                &struct_def.field_map,
+                struct_map,
+            )?;
+            reader
+                .read_struct_end()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(ThriftValue::Struct {
                 name: Some(struct_name.clone()),
                 fields: nested.values,
@@ -514,7 +566,9 @@ pub(crate) fn deserialize_rust_struct<P: TInputProtocol>(
             skip_value(reader, field_begin.field_type)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         }
-        reader.read_field_end().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        reader
+            .read_field_end()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     }
     Ok(result)
 }
@@ -592,9 +646,13 @@ pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
                 list.append(item.bind(py))?;
             }
             if matches!(thrift_type, ThriftType::List(_)) {
-                reader.read_list_end().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                reader
+                    .read_list_end()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             } else {
-                reader.read_set_end().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+                reader
+                    .read_set_end()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             }
             Ok(list.into_any().unbind())
         }
@@ -609,7 +667,9 @@ pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
                 let v = read_value_with_structs(reader, val_type, struct_map, py)?;
                 dict.set_item(k.bind(py), v.bind(py))?;
             }
-            reader.read_map_end().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            reader
+                .read_map_end()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(dict.into_any().unbind())
         }
         ThriftType::Struct(struct_name) => {
@@ -619,13 +679,13 @@ pub(crate) fn read_value_with_structs<'py, P: TInputProtocol>(
                     struct_name
                 ))
             })?;
-            reader.read_struct_begin().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
-            let instance = deserialize_struct_fields_as_instance(
-                reader,
-                struct_def,
-                py,
-            )?;
-            reader.read_struct_end().map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            reader
+                .read_struct_begin()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            let instance = deserialize_struct_fields_as_instance(reader, struct_def, py)?;
+            reader
+                .read_struct_end()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
             Ok(instance.into_any().unbind())
         }
     }
@@ -664,53 +724,62 @@ pub(crate) fn read_struct_as_dict<'py, P: TInputProtocol>(
 }
 
 /// Skip over a value of the given wire type without allocating Python objects.
-pub(crate) fn skip_value<P: TInputProtocol>(
-    reader: &mut P,
-    ttype: TType,
-) -> std::io::Result<()> {
+pub(crate) fn skip_value<P: TInputProtocol>(reader: &mut P, ttype: TType) -> std::io::Result<()> {
     match ttype {
-        TType::Bool | TType::Byte => {
-            reader.read_u8_raw()?;
+        TType::Bool => {
+            reader.read_bool()?;
+        }
+        TType::Byte => {
+            reader.read_byte()?;
         }
         TType::I16 => {
-            reader.read_i16_raw()?;
+            reader.read_i16()?;
         }
         TType::I32 => {
-            reader.read_i32_raw()?;
+            reader.read_i32()?;
         }
-        TType::I64 | TType::Double => {
-            reader.read_i64_raw()?;
+        TType::I64 => {
+            reader.read_i64()?;
+        }
+        TType::Double => {
+            reader.read_double()?;
         }
         TType::String => {
             reader.read_string()?;
         }
-        TType::Struct => loop {
-            let ft = reader.read_u8_raw()?;
-            let ft = TType::from_u8(ft)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-            if ft == TType::Stop {
-                break;
+        TType::Struct => {
+            reader.read_struct_begin()?;
+            loop {
+                let field = reader.read_field_begin()?;
+                if field.field_type == TType::Stop {
+                    break;
+                }
+                skip_value(reader, field.field_type)?;
+                reader.read_field_end()?;
             }
-            reader.read_i16_raw()?;
-            skip_value(reader, ft)?;
-        },
+            reader.read_struct_end()?;
+        }
         TType::Map => {
-            let key_type = TType::from_u8(reader.read_u8_raw()?)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-            let val_type = TType::from_u8(reader.read_u8_raw()?)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-            let size = reader.read_i32_raw()?;
-            for _ in 0..size {
-                skip_value(reader, key_type)?;
-                skip_value(reader, val_type)?;
+            let map = reader.read_map_begin()?;
+            for _ in 0..map.size {
+                skip_value(reader, map.key_type)?;
+                skip_value(reader, map.value_type)?;
             }
+            reader.read_map_end()?;
         }
         TType::List | TType::Set => {
-            let elem_type = TType::from_u8(reader.read_u8_raw()?)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad type"))?;
-            let size = reader.read_i32_raw()?;
-            for _ in 0..size {
-                skip_value(reader, elem_type)?;
+            if ttype == TType::List {
+                let list = reader.read_list_begin()?;
+                for _ in 0..list.size {
+                    skip_value(reader, list.element_type)?;
+                }
+                reader.read_list_end()?;
+            } else {
+                let set = reader.read_set_begin()?;
+                for _ in 0..set.size {
+                    skip_value(reader, set.element_type)?;
+                }
+                reader.read_set_end()?;
             }
         }
         _ => {}
@@ -977,4 +1046,3 @@ pub(crate) fn py_any_to_thrift_value_with_type(
         }
     }
 }
-

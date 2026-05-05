@@ -75,13 +75,36 @@ print(restored)
 Example:
 
 ```python
-from thriftrs2 import load, serialize, deserialize, ProtocolType
+from thriftrs2 import load, serialize, deserialize, dumps, loads, ProtocolType
 
 mod = load("example.thrift")
 user = {"id": 1, "name": "Compact User", "email": "compact@example.com"}
 
 compact_blob = serialize(mod.User, user, proto=ProtocolType.Compact)
 restored = deserialize(mod.User, compact_blob, proto=ProtocolType.Compact)
+
+json_text = dumps(mod.User, user)
+json_restored = loads(mod.User, json_text)
+```
+
+The same protocol enum can be used by the RPC helpers. Both client and server
+must use the same protocol:
+
+```python
+server = make_server(
+    mod.UserService,
+    Handler(),
+    transport=TBufferedTransport.transport_type,
+    protocol=ProtocolType.JSON,
+)
+
+client = make_client(
+    mod.UserService,
+    "127.0.0.1",
+    9090,
+    TBufferedTransport.transport_type,
+    protocol=ProtocolType.JSON,
+)
 ```
 
 ## RPC helpers
@@ -89,11 +112,17 @@ restored = deserialize(mod.User, compact_blob, proto=ProtocolType.Compact)
 ### Client
 
 ```python
-from thriftrs2 import load, make_client, TBufferedTransport
+from thriftrs2 import load, make_client, TBufferedTransport, ProtocolType
 
 mod = load("example.thrift")
 
-with make_client(mod.UserService, "127.0.0.1", 9090, TBufferedTransport.transport_type) as client:
+with make_client(
+    mod.UserService,
+    "127.0.0.1",
+    9090,
+    TBufferedTransport.transport_type,
+    protocol=ProtocolType.Binary,
+) as client:
     user = client.call("get_user", user_id=1)
     print(user)
 ```
@@ -101,7 +130,7 @@ with make_client(mod.UserService, "127.0.0.1", 9090, TBufferedTransport.transpor
 ### Server
 
 ```python
-from thriftrs2 import load, make_server, TBufferedTransport
+from thriftrs2 import load, make_server, TBufferedTransport, ProtocolType
 
 mod = load("example.thrift")
 
@@ -113,6 +142,7 @@ server = make_server(
     mod.UserService,
     Handler(),
     transport=TBufferedTransport.transport_type,
+    protocol=ProtocolType.Binary,
     workers=4,
 )
 server.serve_forever("127.0.0.1", 9090)

@@ -20,35 +20,35 @@ use std::io::{Read, Write};
 
 fn ttype_to_json_name(t: TType) -> &'static str {
     match t {
-        TType::Bool   => "tf",
-        TType::Byte   => "i8",
-        TType::I16    => "i16",
-        TType::I32    => "i32",
-        TType::I64    => "i64",
+        TType::Bool => "tf",
+        TType::Byte => "i8",
+        TType::I16 => "i16",
+        TType::I32 => "i32",
+        TType::I64 => "i64",
         TType::Double => "dbl",
         TType::String => "str",
         TType::Struct => "rec",
-        TType::Map    => "map",
-        TType::List   => "lst",
-        TType::Set    => "set",
+        TType::Map => "map",
+        TType::List => "lst",
+        TType::Set => "set",
         TType::Stop | TType::Void => "stop",
     }
 }
 
 fn json_name_to_ttype(s: &str) -> Option<TType> {
     match s {
-        "tf"   => Some(TType::Bool),
-        "i8"   => Some(TType::Byte),
-        "i16"  => Some(TType::I16),
-        "i32"  => Some(TType::I32),
-        "i64"  => Some(TType::I64),
-        "dbl"  => Some(TType::Double),
-        "str"  => Some(TType::String),
-        "rec"  => Some(TType::Struct),
-        "map"  => Some(TType::Map),
-        "lst"  => Some(TType::List),
-        "set"  => Some(TType::Set),
-        _      => None,
+        "tf" => Some(TType::Bool),
+        "i8" => Some(TType::Byte),
+        "i16" => Some(TType::I16),
+        "i32" => Some(TType::I32),
+        "i64" => Some(TType::I64),
+        "dbl" => Some(TType::Double),
+        "str" => Some(TType::String),
+        "rec" => Some(TType::Struct),
+        "map" => Some(TType::Map),
+        "lst" => Some(TType::List),
+        "set" => Some(TType::Set),
+        _ => None,
     }
 }
 
@@ -70,10 +70,7 @@ enum WriteFrame {
         current_field: Option<(i16, TType)>,
     },
     /// List/Set array `[ttype_str, size, v0, v1, …]`.
-    List {
-        elem_type: TType,
-        items: Vec<Value>,
-    },
+    List { elem_type: TType, items: Vec<Value> },
     /// Map `[ktype_str, vtype_str, size, {k: v, …}]` — we collect pairs.
     Map {
         key_type: TType,
@@ -114,7 +111,9 @@ impl<W: Write> JSONProtocolWriter<W> {
             Some(WriteFrame::List { items, .. }) => {
                 items.push(v);
             }
-            Some(WriteFrame::Map { pending_key, pairs, .. }) => {
+            Some(WriteFrame::Map {
+                pending_key, pairs, ..
+            }) => {
                 if let Some(k) = pending_key.take() {
                     pairs.push((k, v));
                 } else {
@@ -138,7 +137,12 @@ impl<W: Write> JSONProtocolWriter<W> {
                 arr.extend(items);
                 Value::Array(arr)
             }
-            WriteFrame::Map { key_type, val_type, pairs, .. } => {
+            WriteFrame::Map {
+                key_type,
+                val_type,
+                pairs,
+                ..
+            } => {
                 let map_obj: Map<String, Value> = pairs
                     .into_iter()
                     .map(|(k, v)| {
@@ -157,7 +161,11 @@ impl<W: Write> JSONProtocolWriter<W> {
                     Value::Object(map_obj)
                 ])
             }
-            WriteFrame::Message { name, message_type, seq_id } => {
+            WriteFrame::Message {
+                name,
+                message_type,
+                seq_id,
+            } => {
                 json!([1, name, message_type, seq_id])
             }
         }
@@ -181,13 +189,22 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
 
     fn write_message_end(&mut self) -> Result<(), ProtocolError> {
         // Pop struct body frame.
-        let body_frame = self.stack.pop()
+        let body_frame = self
+            .stack
+            .pop()
             .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let body = Self::frame_to_value(body_frame);
         // Pop message frame.
-        let msg_frame = self.stack.pop()
+        let msg_frame = self
+            .stack
+            .pop()
             .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
-        if let WriteFrame::Message { name, message_type, seq_id } = msg_frame {
+        if let WriteFrame::Message {
+            name,
+            message_type,
+            seq_id,
+        } = msg_frame
+        {
             let msg = json!([1, name, message_type, seq_id, body]);
             let s = serde_json::to_string(&msg)
                 .map_err(|e| ProtocolError::Io(std::io::Error::other(e)))?;
@@ -205,7 +222,9 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
     }
 
     fn write_struct_end(&mut self) -> Result<(), ProtocolError> {
-        let frame = self.stack.pop()
+        let frame = self
+            .stack
+            .pop()
             .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         if self.stack.is_empty() {
@@ -226,8 +245,12 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
         Ok(())
     }
 
-    fn write_field_end(&mut self) -> Result<(), ProtocolError> { Ok(()) }
-    fn write_field_stop(&mut self) -> Result<(), ProtocolError> { Ok(()) }
+    fn write_field_end(&mut self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+    fn write_field_stop(&mut self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
 
     fn write_bool(&mut self, value: bool) -> Result<(), ProtocolError> {
         self.push_value(Value::Number((if value { 1u64 } else { 0u64 }).into()))
@@ -251,8 +274,8 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
     }
 
     fn write_double(&mut self, value: f64) -> Result<(), ProtocolError> {
-        let n = serde_json::Number::from_f64(value)
-            .unwrap_or_else(|| serde_json::Number::from(0i64));
+        let n =
+            serde_json::Number::from_f64(value).unwrap_or_else(|| serde_json::Number::from(0i64));
         self.push_value(Value::Number(n))
     }
 
@@ -275,7 +298,9 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
     }
 
     fn write_map_end(&mut self) -> Result<(), ProtocolError> {
-        let frame = self.stack.pop()
+        let frame = self
+            .stack
+            .pop()
             .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         self.push_value(v)
@@ -290,7 +315,9 @@ impl<W: Write> TOutputProtocol for JSONProtocolWriter<W> {
     }
 
     fn write_list_end(&mut self) -> Result<(), ProtocolError> {
-        let frame = self.stack.pop()
+        let frame = self
+            .stack
+            .pop()
             .ok_or_else(|| ProtocolError::Io(std::io::Error::other("stack underflow")))?;
         let v = Self::frame_to_value(frame);
         self.push_value(v)
@@ -358,9 +385,12 @@ impl<R: Read> JSONProtocolReader<R> {
     fn ensure_parsed(&mut self) -> Result<(), ProtocolError> {
         if self.root.is_none() {
             let mut buf = String::new();
-            self.reader.read_to_string(&mut buf).map_err(ProtocolError::Io)?;
-            let v: Value = serde_json::from_str(&buf)
-                .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            self.reader
+                .read_to_string(&mut buf)
+                .map_err(ProtocolError::Io)?;
+            let v: Value = serde_json::from_str(&buf).map_err(|e| {
+                ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             self.root = Some(v);
         }
         Ok(())
@@ -377,7 +407,12 @@ impl<R: Read> JSONProtocolReader<R> {
                 *index += 1;
                 items.get(i).cloned().ok_or(ProtocolError::InvalidFieldType)
             }
-            Some(ReadFrame::Map { pairs, index, reading_key, .. }) => {
+            Some(ReadFrame::Map {
+                pairs,
+                index,
+                reading_key,
+                ..
+            }) => {
                 let i = *index;
                 let is_key = *reading_key;
                 *reading_key = !is_key;
@@ -390,26 +425,54 @@ impl<R: Read> JSONProtocolReader<R> {
             None => self.root.take().ok_or(ProtocolError::InvalidFieldType),
         }
     }
+
+    fn map_key_to_value(key_type: TType, key: &str) -> Value {
+        match key_type {
+            TType::Bool => Value::Number((if key == "1" || key == "true" { 1 } else { 0 }).into()),
+            TType::Byte | TType::I16 | TType::I32 => key
+                .parse::<i64>()
+                .map(|value| Value::Number(value.into()))
+                .unwrap_or_else(|_| Value::Number(0.into())),
+            TType::I64 | TType::Double => Value::String(key.to_owned()),
+            _ => Value::String(key.to_owned()),
+        }
+    }
 }
 
 impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
     fn read_message_begin(&mut self) -> Result<MessageBegin, ProtocolError> {
         self.ensure_parsed()?;
-        let data = self.root.as_ref().ok_or(ProtocolError::InvalidFieldType)?.clone();
+        let data = self
+            .root
+            .as_ref()
+            .ok_or(ProtocolError::InvalidFieldType)?
+            .clone();
         let arr = data.as_array().ok_or(ProtocolError::InvalidFieldType)?;
         if arr.len() < 5 {
             return Err(ProtocolError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData, "JSON message array too short")));
+                std::io::ErrorKind::InvalidData,
+                "JSON message array too short",
+            )));
         }
         let name = arr[1].as_str().unwrap_or("").to_owned();
         let message_type = arr[2].as_u64().unwrap_or(1) as u8;
         let seq_id = arr[3].as_i64().unwrap_or(0) as i32;
         let body = arr[4].clone();
         if let Some(obj) = body.as_object() {
-            let fields: Vec<(String, Value)> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            self.stack.push(ReadFrame::Struct { fields, index: 0, current_type: None, current_value: None });
+            let fields: Vec<(String, Value)> =
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.stack.push(ReadFrame::Struct {
+                fields,
+                index: 0,
+                current_type: None,
+                current_value: None,
+            });
         }
-        Ok(MessageBegin { name, message_type, seq_id })
+        Ok(MessageBegin {
+            name,
+            message_type,
+            seq_id,
+        })
     }
 
     fn read_message_end(&mut self) -> Result<(), ProtocolError> {
@@ -427,8 +490,14 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
             self.pop_scalar()?
         };
         let obj = v.as_object().ok_or(ProtocolError::InvalidFieldType)?;
-        let fields: Vec<(String, Value)> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        self.stack.push(ReadFrame::Struct { fields, index: 0, current_type: None, current_value: None });
+        let fields: Vec<(String, Value)> =
+            obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.stack.push(ReadFrame::Struct {
+            fields,
+            index: 0,
+            current_type: None,
+            current_value: None,
+        });
         Ok(())
     }
 
@@ -439,10 +508,19 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
 
     fn read_field_begin(&mut self) -> Result<FieldBegin, ProtocolError> {
         match self.stack.last_mut() {
-            Some(ReadFrame::Struct { fields, index, current_type, current_value }) => {
+            Some(ReadFrame::Struct {
+                fields,
+                index,
+                current_type,
+                current_value,
+            }) => {
                 let i = *index;
                 if i >= fields.len() {
-                    return Ok(FieldBegin { name: None, field_type: TType::Stop, id: 0 });
+                    return Ok(FieldBegin {
+                        name: None,
+                        field_type: TType::Stop,
+                        id: 0,
+                    });
                 }
                 let (fid_str, entry) = &fields[i];
                 let fid: i16 = fid_str.parse().unwrap_or(0);
@@ -455,13 +533,23 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
                 *current_type = Some(ftype);
                 *current_value = Some(arr[1].clone());
                 *index += 1;
-                Ok(FieldBegin { name: None, field_type: ftype, id: fid })
+                Ok(FieldBegin {
+                    name: None,
+                    field_type: ftype,
+                    id: fid,
+                })
             }
-            _ => Ok(FieldBegin { name: None, field_type: TType::Stop, id: 0 }),
+            _ => Ok(FieldBegin {
+                name: None,
+                field_type: TType::Stop,
+                id: 0,
+            }),
         }
     }
 
-    fn read_field_end(&mut self) -> Result<(), ProtocolError> { Ok(()) }
+    fn read_field_end(&mut self) -> Result<(), ProtocolError> {
+        Ok(())
+    }
 
     fn read_bool(&mut self) -> Result<bool, ProtocolError> {
         let v = self.pop_scalar()?;
@@ -509,7 +597,8 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
     fn read_binary(&mut self) -> Result<Vec<u8>, ProtocolError> {
         let v = self.pop_scalar()?;
         let s = v.as_str().unwrap_or("");
-        BASE64.decode(s)
+        BASE64
+            .decode(s)
             .map_err(|e| ProtocolError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
     }
 
@@ -520,15 +609,28 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
         if arr.len() < 4 {
             return Err(ProtocolError::InvalidFieldType);
         }
-        let key_type = json_name_to_ttype(arr[0].as_str().unwrap_or("")).ok_or(ProtocolError::InvalidFieldType)?;
-        let val_type = json_name_to_ttype(arr[1].as_str().unwrap_or("")).ok_or(ProtocolError::InvalidFieldType)?;
+        let key_type = json_name_to_ttype(arr[0].as_str().unwrap_or(""))
+            .ok_or(ProtocolError::InvalidFieldType)?;
+        let val_type = json_name_to_ttype(arr[1].as_str().unwrap_or(""))
+            .ok_or(ProtocolError::InvalidFieldType)?;
         let size = arr[2].as_i64().unwrap_or(0) as i32;
         let map_obj = arr[3].as_object().ok_or(ProtocolError::InvalidFieldType)?;
-        let pairs: Vec<(Value, Value)> = map_obj.iter()
-            .map(|(k, v)| (Value::String(k.clone()), v.clone()))
+        let pairs: Vec<(Value, Value)> = map_obj
+            .iter()
+            .map(|(k, v)| (Self::map_key_to_value(key_type, k), v.clone()))
             .collect();
-        self.stack.push(ReadFrame::Map { key_type, val_type, pairs, index: 0, reading_key: true });
-        Ok(MapBegin { key_type, value_type: val_type, size })
+        self.stack.push(ReadFrame::Map {
+            key_type,
+            val_type,
+            pairs,
+            index: 0,
+            reading_key: true,
+        });
+        Ok(MapBegin {
+            key_type,
+            value_type: val_type,
+            size,
+        })
     }
 
     fn read_map_end(&mut self) -> Result<(), ProtocolError> {
@@ -543,11 +645,19 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
         if arr.len() < 2 {
             return Err(ProtocolError::InvalidFieldType);
         }
-        let elem_type = json_name_to_ttype(arr[0].as_str().unwrap_or("")).ok_or(ProtocolError::InvalidFieldType)?;
+        let elem_type = json_name_to_ttype(arr[0].as_str().unwrap_or(""))
+            .ok_or(ProtocolError::InvalidFieldType)?;
         let size = arr[1].as_i64().unwrap_or(0) as i32;
         let items: Vec<Value> = arr[2..].to_vec();
-        self.stack.push(ReadFrame::List { elem_type, items, index: 0 });
-        Ok(ListBegin { element_type: elem_type, size })
+        self.stack.push(ReadFrame::List {
+            elem_type,
+            items,
+            index: 0,
+        });
+        Ok(ListBegin {
+            element_type: elem_type,
+            size,
+        })
     }
 
     fn read_list_end(&mut self) -> Result<(), ProtocolError> {
@@ -557,19 +667,167 @@ impl<R: Read> TInputProtocol for JSONProtocolReader<R> {
 
     fn read_set_begin(&mut self) -> Result<SetBegin, ProtocolError> {
         let lb = self.read_list_begin()?;
-        Ok(SetBegin { element_type: lb.element_type, size: lb.size })
+        Ok(SetBegin {
+            element_type: lb.element_type,
+            size: lb.size,
+        })
     }
 
     fn read_set_end(&mut self) -> Result<(), ProtocolError> {
         self.read_list_end()
     }
-
-    fn read_u8_raw(&mut self) -> Result<u8, ProtocolError> {
-        Ok(self.read_byte()? as u8)
-    }
-    fn read_i16_raw(&mut self) -> Result<i16, ProtocolError> { self.read_i16() }
-    fn read_i32_raw(&mut self) -> Result<i32, ProtocolError> { self.read_i32() }
-    fn read_i64_raw(&mut self) -> Result<i64, ProtocolError> { self.read_i64() }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::io::Cursor;
 
+    fn json_value(bytes: &[u8]) -> Value {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    #[test]
+    fn writes_simple_struct() {
+        let mut bytes = Vec::new();
+        let mut writer = JSONProtocolWriter::new(&mut bytes);
+        writer.write_struct_begin("User").unwrap();
+        writer
+            .write_field_begin(&FieldBegin {
+                name: None,
+                field_type: TType::I32,
+                id: 1,
+            })
+            .unwrap();
+        writer.write_i32(7).unwrap();
+        writer.write_field_stop().unwrap();
+        writer.write_struct_end().unwrap();
+        assert_eq!(json_value(&bytes), serde_json::json!({"1": ["i32", 7]}));
+    }
+
+    #[test]
+    fn reads_simple_struct() {
+        let mut reader = JSONProtocolReader::new(Cursor::new(br#"{"1":["str","Ada"]}"#.to_vec()));
+        reader.read_struct_begin().unwrap();
+        let field = reader.read_field_begin().unwrap();
+        assert_eq!(field.id, 1);
+        assert_eq!(field.field_type, TType::String);
+        assert_eq!(reader.read_string().unwrap(), "Ada");
+        assert_eq!(reader.read_field_begin().unwrap().field_type, TType::Stop);
+    }
+
+    #[test]
+    fn writes_i64_as_string() {
+        let mut bytes = Vec::new();
+        let mut writer = JSONProtocolWriter::new(&mut bytes);
+        writer.write_struct_begin("N").unwrap();
+        writer
+            .write_field_begin(&FieldBegin {
+                name: None,
+                field_type: TType::I64,
+                id: 1,
+            })
+            .unwrap();
+        writer.write_i64(9_000_000_000).unwrap();
+        writer.write_field_stop().unwrap();
+        writer.write_struct_end().unwrap();
+        assert_eq!(
+            json_value(&bytes)["1"],
+            serde_json::json!(["i64", "9000000000"])
+        );
+    }
+
+    #[test]
+    fn writes_binary_as_base64() {
+        let mut bytes = Vec::new();
+        let mut writer = JSONProtocolWriter::new(&mut bytes);
+        writer.write_struct_begin("Blob").unwrap();
+        writer
+            .write_field_begin(&FieldBegin {
+                name: None,
+                field_type: TType::String,
+                id: 1,
+            })
+            .unwrap();
+        writer.write_binary(b"abc").unwrap();
+        writer.write_field_stop().unwrap();
+        writer.write_struct_end().unwrap();
+        assert_eq!(json_value(&bytes)["1"], serde_json::json!(["str", "YWJj"]));
+    }
+
+    #[test]
+    fn round_trips_list_header_and_items() {
+        let data = br#"{"1":["lst",["i32",3,1,2,3]]}"#.to_vec();
+        let mut reader = JSONProtocolReader::new(Cursor::new(data));
+        reader.read_struct_begin().unwrap();
+        assert_eq!(reader.read_field_begin().unwrap().field_type, TType::List);
+        let list = reader.read_list_begin().unwrap();
+        assert_eq!(list.element_type, TType::I32);
+        assert_eq!(list.size, 3);
+        assert_eq!(reader.read_i32().unwrap(), 1);
+        assert_eq!(reader.read_i32().unwrap(), 2);
+        assert_eq!(reader.read_i32().unwrap(), 3);
+        reader.read_list_end().unwrap();
+    }
+
+    #[test]
+    fn reads_numeric_map_keys_as_numbers() {
+        let data = br#"{"1":["map",["i32","str",2,{"1":"one","-2":"minus"}]]}"#.to_vec();
+        let mut reader = JSONProtocolReader::new(Cursor::new(data));
+        reader.read_struct_begin().unwrap();
+        assert_eq!(reader.read_field_begin().unwrap().field_type, TType::Map);
+        let map = reader.read_map_begin().unwrap();
+        assert_eq!(map.key_type, TType::I32);
+        assert_eq!(map.value_type, TType::String);
+        let mut pairs = vec![
+            (reader.read_i32().unwrap(), reader.read_string().unwrap()),
+            (reader.read_i32().unwrap(), reader.read_string().unwrap()),
+        ];
+        pairs.sort_by_key(|(key, _)| *key);
+        assert_eq!(
+            pairs,
+            vec![(-2, "minus".to_string()), (1, "one".to_string())]
+        );
+    }
+
+    #[test]
+    fn writes_message_with_body() {
+        let mut bytes = Vec::new();
+        let mut writer = JSONProtocolWriter::new(&mut bytes);
+        writer
+            .write_message_begin(&MessageBegin {
+                name: "ping".to_string(),
+                message_type: 1,
+                seq_id: 3,
+            })
+            .unwrap();
+        writer
+            .write_field_begin(&FieldBegin {
+                name: None,
+                field_type: TType::String,
+                id: 1,
+            })
+            .unwrap();
+        writer.write_string("hello").unwrap();
+        writer.write_field_stop().unwrap();
+        writer.write_message_end().unwrap();
+        assert_eq!(
+            json_value(&bytes),
+            serde_json::json!([1, "ping", 1, 3, {"1": ["str", "hello"]}])
+        );
+    }
+
+    #[test]
+    fn reads_message_begin_and_body() {
+        let data = br#"[1,"ping",1,3,{"1":["i32",7]}]"#.to_vec();
+        let mut reader = JSONProtocolReader::new(Cursor::new(data));
+        let msg = reader.read_message_begin().unwrap();
+        assert_eq!(msg.name, "ping");
+        assert_eq!(msg.message_type, 1);
+        assert_eq!(msg.seq_id, 3);
+        let field = reader.read_field_begin().unwrap();
+        assert_eq!(field.id, 1);
+        assert_eq!(reader.read_i32().unwrap(), 7);
+    }
+}

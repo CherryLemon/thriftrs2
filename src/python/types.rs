@@ -7,9 +7,7 @@ use pyo3::types::PyDict;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::serde::{
-    py_any_to_thrift_value, py_any_to_thrift_value_with_type, thrift_value_to_py,
-};
+use super::serde::{py_any_to_thrift_value, py_any_to_thrift_value_with_type, thrift_value_to_py};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // ThriftField
@@ -130,30 +128,48 @@ impl ThriftStruct {
         data: &Bound<'_, PyAny>,
         protocol: crate::python::parser::ProtocolType,
     ) -> PyResult<Vec<u8>> {
+        use super::serde::serialize_struct_any;
         use crate::protocol::{
             BinaryProtocolWriter, CompactProtocolWriter, JSONProtocolWriter, TOutputProtocol,
         };
-        use super::serde::serialize_struct_any;
         let mut buffer = Vec::with_capacity(128 + self.fields.len() * 16);
         match protocol {
             crate::python::parser::ProtocolType::Binary => {
                 let mut writer = BinaryProtocolWriter::new(&mut buffer);
+                writer.write_struct_begin(&self.name).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
                 serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
                 writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+                writer.write_struct_end().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
                 })?;
             }
             crate::python::parser::ProtocolType::Compact => {
                 let mut writer = CompactProtocolWriter::new(&mut buffer);
+                writer.write_struct_begin(&self.name).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
                 serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
                 writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+                writer.write_struct_end().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
                 })?;
             }
             crate::python::parser::ProtocolType::JSON => {
                 let mut writer = JSONProtocolWriter::new(&mut buffer);
+                writer.write_struct_begin(&self.name).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
                 serialize_struct_any(&mut writer, &self.fields, data, &self.struct_map, py)?;
                 writer.write_field_stop().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+                })?;
+                writer.write_struct_end().map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
                 })?;
             }
@@ -172,25 +188,46 @@ impl ThriftStruct {
         data: &[u8],
         protocol: crate::python::parser::ProtocolType,
     ) -> PyResult<Bound<'py, ThriftStructInstance>> {
-        use std::io::Cursor;
-        use crate::protocol::{
-            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader,
-        };
         use super::serde::deserialize_struct_fields_as_instance;
+        use crate::protocol::{
+            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader, TInputProtocol,
+        };
+        use std::io::Cursor;
         let mut cursor = Cursor::new(data);
 
         match protocol {
             crate::python::parser::ProtocolType::Binary => {
                 let mut reader = BinaryProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(&mut reader, self, py)
+                reader.read_struct_begin().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                let instance = deserialize_struct_fields_as_instance(&mut reader, self, py)?;
+                reader.read_struct_end().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                Ok(instance)
             }
             crate::python::parser::ProtocolType::Compact => {
                 let mut reader = CompactProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(&mut reader, self, py)
+                reader.read_struct_begin().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                let instance = deserialize_struct_fields_as_instance(&mut reader, self, py)?;
+                reader.read_struct_end().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                Ok(instance)
             }
             crate::python::parser::ProtocolType::JSON => {
                 let mut reader = JSONProtocolReader::new(&mut cursor);
-                deserialize_struct_fields_as_instance(&mut reader, self, py)
+                reader.read_struct_begin().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                let instance = deserialize_struct_fields_as_instance(&mut reader, self, py)?;
+                reader.read_struct_end().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
+                })?;
+                Ok(instance)
             }
         }
     }
@@ -234,7 +271,6 @@ pub struct ThriftStructInstance {
     /// Shared struct map for resolving nested struct types in schema-aware coercion.
     pub struct_map: Arc<HashMap<String, ThriftStruct>>,
 }
-
 
 impl Clone for ThriftStructInstance {
     fn clone(&self) -> Self {
@@ -350,10 +386,9 @@ impl ThriftStructInstance {
                 .map(|v| v.unbind())
                 .unwrap_or_else(|| py.None()))
         } else {
-            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(format!(
-                "'{}' object has no attribute '{}'",
-                self.struct_name, name
-            )))
+            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
+                format!("'{}' object has no attribute '{}'", self.struct_name, name),
+            ))
         }
     }
 
@@ -373,10 +408,9 @@ impl ThriftStructInstance {
             }
             Ok(())
         } else {
-            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(format!(
-                "'{}' object has no attribute '{}'",
-                self.struct_name, name
-            )))
+            Err(PyErr::new::<pyo3::exceptions::PyAttributeError, _>(
+                format!("'{}' object has no attribute '{}'", self.struct_name, name),
+            ))
         }
     }
 
@@ -489,4 +523,3 @@ impl TransportType {
         Self::Framed
     }
 }
-

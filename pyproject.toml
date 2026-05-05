@@ -52,3 +52,8 @@ dev = [
 python-source = "python"
 module-name = "thriftrs2.thriftrs2"
 features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+markers = [
+    "rpc: end-to-end client/server tests that bind local TCP ports",
+]
