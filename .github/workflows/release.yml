@@ -36,7 +36,12 @@ jobs:
             -i python3.12 -i python3.13 -i python3.14
           manylinux: "2_28"
           sdist: ${{ matrix.target == 'x86_64' }}
-          artifact-name: wheels-linux-${{ matrix.target }}-2_28
+      - name: List built wheels
+        run: ls -la dist/
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-linux-${{ matrix.target }}-2_28
+          path: dist/
 
   linux-manylinux2014:
     runs-on: ubuntu-latest
@@ -55,8 +60,12 @@ jobs:
             -i python3.9 -i python3.10 -i python3.11
             -i python3.12 -i python3.13
           manylinux: auto
-          sdist: false
-          artifact-name: wheels-linux-${{ matrix.target }}-2014
+      - name: List built wheels
+        run: ls -la dist/
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-linux-${{ matrix.target }}-2014
+          path: dist/
 
   windows:
     runs-on: windows-latest
@@ -87,7 +96,12 @@ jobs:
             --release --out dist
             -i python3.9 -i python3.10 -i python3.11
             -i python3.12 -i python3.13 -i python3.14
-          artifact-name: wheels-windows-x64
+      - name: List built wheels
+        run: ls dist/
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-windows-x64
+          path: dist/
 
   macos:
     runs-on: macos-latest
@@ -119,7 +133,12 @@ jobs:
             -i python3.9 -i python3.10 -i python3.11
             -i python3.12 -i python3.13 -i python3.14
             --target universal2-apple-darwin
-          artifact-name: wheels-macos-universal2
+      - name: List built wheels
+        run: ls -la dist/
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-macos-universal2
+          path: dist/
 
   collect:
     name: Check distributions
@@ -134,6 +153,8 @@ jobs:
           pattern: wheels-*
           path: dist
           merge-multiple: true
+      - name: Show downloaded wheels
+        run: ls -la dist/
       - name: Twine check
         run: |
           python -m pip install --upgrade pip twine
