@@ -267,6 +267,7 @@ impl ThriftClient {
         };
 
         let return_type = method.return_type.clone();
+        let exceptions = method.exceptions.clone();
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
         let protocol = self.protocol;
@@ -309,15 +310,15 @@ impl ThriftClient {
         match protocol {
             ProtocolType::Binary => {
                 let mut reader = BinaryProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &struct_map, py)
+                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
             }
             ProtocolType::Compact => {
                 let mut reader = CompactProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &struct_map, py)
+                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
             }
             ProtocolType::JSON => {
                 let mut reader = JSONProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &struct_map, py)
+                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
             }
         }
     }
@@ -369,6 +370,7 @@ fn write_call_frame<P: TOutputProtocol>(
 fn decode_reply<P: TInputProtocol>(
     reader: &mut P,
     return_type: &ThriftType,
+    exceptions: &[ThriftField],
     struct_map: &HashMap<String, ThriftStruct>,
     py: Python<'_>,
 ) -> PyResult<Py<PyAny>> {
@@ -399,16 +401,27 @@ fn decode_reply<P: TInputProtocol>(
     }
 
     if field_begin.id != 0 {
-        let ex_py = read_value_with_structs(reader, return_type, struct_map, py)
-            .unwrap_or_else(|_| py.None());
+        let declared = exceptions.iter().find(|field| field.id == field_begin.id);
+        let ex_py = if let Some(exception_field) = declared {
+            read_value_with_structs(reader, &exception_field.field_type, struct_map, py)
+                .unwrap_or_else(|_| py.None())
+        } else {
+            skip_value(reader, field_begin.field_type)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+            py.None()
+        };
         reader
             .read_field_end()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         reader
             .read_message_end()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let field_name = declared
+            .map(|field| field.name.as_str())
+            .unwrap_or("unknown");
         return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-            "Service exception (field {}): {:?}",
+            "Service exception '{}' (field {}): {:?}",
+            field_name,
             field_begin.id,
             ex_py
                 .bind(py)

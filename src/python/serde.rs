@@ -5,8 +5,10 @@ use crate::parser::ast::*;
 use crate::protocol::{
     FieldBegin, ListBegin, MapBegin, SetBegin, TInputProtocol, TOutputProtocol, TType,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -127,6 +129,11 @@ pub(crate) fn serialize_struct_fields<P: TOutputProtocol>(
     struct_map: &HashMap<String, ThriftStruct>,
 ) -> PyResult<()> {
     for field in fields {
+        let field_begin = FieldBegin {
+            name: None,
+            field_type: thrift_type_to_ttype(&field.field_type),
+            id: field.id,
+        };
         if let Some(value) = data.get_item(&field.name)? {
             if value.is_none() {
                 if field.required {
@@ -137,15 +144,20 @@ pub(crate) fn serialize_struct_fields<P: TOutputProtocol>(
                 }
                 continue;
             }
-            let field_begin = FieldBegin {
-                name: None,
-                field_type: thrift_type_to_ttype(&field.field_type),
-                id: field.id,
-            };
             writer.write_field_begin(&field_begin).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
             })?;
             write_value_with_structs(writer, &field.field_type, &value, struct_map)?;
+            writer.write_field_end().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+            })?;
+        } else if let Some(default_value) = &field.default_value {
+            writer.write_field_begin(&field_begin).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+            })?;
+            write_thrift_value(writer, default_value, struct_map).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
+            })?;
             writer.write_field_end().map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Write error: {}", e))
             })?;
@@ -851,6 +863,203 @@ pub(crate) fn thrift_value_to_py(
             Ok(Bound::new(py, instance)?.into_any().unbind())
         }
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// JSON Value → Python direct conversion (skips ThriftValue intermediate)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Walk a `serde_json::Value` tree with Thrift schema to build Python objects
+/// directly, avoiding the ThriftValue intermediate allocation.
+///
+/// `value` is the TJSON-wrapped field value (i.e. `arr[1]` from a
+/// `[type_str, value]` pair, already peeled from the outer type tag).
+pub(crate) fn json_value_to_py(
+    value: &JsonValue,
+    field_type: &ThriftType,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+    py: Python<'_>,
+) -> PyResult<Py<PyAny>> {
+    match field_type {
+        ThriftType::Bool => {
+            let v = value.as_i64().unwrap_or(0) != 0 || value.as_bool().unwrap_or(false);
+            Ok(v.into_pyobject(py)?.to_owned().into_any().unbind())
+        }
+        ThriftType::Byte => {
+            Ok((value.as_i64().unwrap_or(0) as i8).into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I16 => {
+            Ok((value.as_i64().unwrap_or(0) as i16).into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I32 => {
+            Ok((value.as_i64().unwrap_or(0) as i32).into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I64 => {
+            if let Some(s) = value.as_str() {
+                let n: i64 = s.parse().unwrap_or(0);
+                Ok(n.into_pyobject(py)?.into_any().unbind())
+            } else {
+                Ok(value.as_i64().unwrap_or(0).into_pyobject(py)?.into_any().unbind())
+            }
+        }
+        ThriftType::Double => {
+            if let Some(s) = value.as_str() {
+                let n: f64 = s.parse().unwrap_or(0.0);
+                Ok(n.into_pyobject(py)?.into_any().unbind())
+            } else {
+                Ok(value.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any().unbind())
+            }
+        }
+        ThriftType::String => {
+            let s = value.as_str().unwrap_or("");
+            Ok(s.into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::Binary => {
+            let s = value.as_str().unwrap_or("");
+            let decoded = BASE64.decode(s).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Base64 error: {}", e))
+            })?;
+            Ok(PyBytes::new(py, &decoded).into_any().unbind())
+        }
+        // TJSON list value: [elem_type_str, size, item0, item1, ...]
+        ThriftType::List(elem_type) | ThriftType::Set(elem_type) => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected JSON array"))?;
+            let items = if arr.len() >= 2 { &arr[2..] } else { &[] };
+            let list = PyList::empty(py);
+            for item in items {
+                let py_item = json_value_to_py(item, elem_type, struct_map, py)?;
+                list.append(py_item.bind(py))?;
+            }
+            Ok(list.into_any().unbind())
+        }
+        // TJSON map value: [key_type_str, val_type_str, size, {k: v, ...}]
+        ThriftType::Map(key_type, val_type) => {
+            let arr = value
+                .as_array()
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected JSON array for map"))?;
+            if arr.len() < 4 {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("Map array too short"));
+            }
+            let map_obj = arr[3]
+                .as_object()
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected JSON object in map"))?;
+            let dict = PyDict::new(py);
+            for (k_str, v) in map_obj.iter() {
+                let py_key = json_map_key_to_py(k_str, key_type, py)?;
+                let py_val = json_value_to_py(v, val_type, struct_map, py)?;
+                dict.set_item(py_key.bind(py), py_val.bind(py))?;
+            }
+            Ok(dict.into_any().unbind())
+        }
+        // TJSON struct value: {"fid_str": [type_str, field_value], ...}
+        ThriftType::Struct(struct_name) => {
+            let struct_def = struct_map.get(struct_name).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Unknown struct: {}", struct_name
+                ))
+            })?;
+            let obj = value
+                .as_object()
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected JSON object for struct"))?;
+            let mut cache = HashMap::new();
+            for (fid_str, entry) in obj.iter() {
+                let fid: i16 = fid_str.parse().unwrap_or(0);
+                let entry_arr = entry.as_array();
+                if entry_arr.is_none() || entry_arr.unwrap().len() < 2 {
+                    continue;
+                }
+                let entry_arr = entry_arr.unwrap();
+                if let Some(&idx) = struct_def.field_map.get(&fid) {
+                    let field = &struct_def.fields[idx];
+                    let py_val = json_value_to_py(&entry_arr[1], &field.field_type, struct_map, py)?;
+                    cache.insert(field.name.clone(), py_val);
+                }
+            }
+            let instance = ThriftStructInstance::from_python_cache(
+                struct_name.clone(),
+                Arc::clone(&struct_def.field_names_arc),
+                cache,
+                Arc::clone(&struct_def.schema_arc),
+                Arc::clone(struct_map),
+            );
+            Ok(Bound::new(py, instance)?.into_any().unbind())
+        }
+    }
+}
+
+/// Convert a TJSON map key string to the appropriate Python type.
+fn json_map_key_to_py(key: &str, key_type: &ThriftType, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    match key_type {
+        ThriftType::Bool => {
+            let v = key == "1" || key.eq_ignore_ascii_case("true");
+            Ok(v.into_pyobject(py)?.to_owned().into_any().unbind())
+        }
+        ThriftType::Byte => {
+            let n: i8 = key.parse().unwrap_or(0);
+            Ok(n.into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I16 => {
+            let n: i16 = key.parse().unwrap_or(0);
+            Ok(n.into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I32 => {
+            let n: i32 = key.parse().unwrap_or(0);
+            Ok(n.into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::I64 => {
+            let n: i64 = key.parse().unwrap_or(0);
+            Ok(n.into_pyobject(py)?.into_any().unbind())
+        }
+        ThriftType::Double => {
+            let n: f64 = key.parse().unwrap_or(0.0);
+            Ok(n.into_pyobject(py)?.into_any().unbind())
+        }
+        _ => Ok(key.into_pyobject(py)?.into_any().unbind()),
+    }
+}
+
+/// Parse JSON bytes and convert directly to Python dict using schema,
+/// then wrap in ThriftStructInstance. Skips the ThriftValue intermediate.
+pub(crate) fn deserialize_json_direct<'py>(
+    struct_def: &ThriftStruct,
+    json_bytes: &[u8],
+    py: Python<'py>,
+) -> PyResult<Bound<'py, ThriftStructInstance>> {
+    let root: JsonValue = serde_json::from_slice(json_bytes).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("JSON parse error: {}", e))
+    })?;
+
+    let obj = root
+        .as_object()
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected JSON object for struct"))?;
+
+    let mut cache = HashMap::new();
+    for (fid_str, entry) in obj.iter() {
+        let fid: i16 = fid_str.parse().unwrap_or(0);
+        let entry_arr = entry.as_array();
+        if entry_arr.is_none() || entry_arr.unwrap().len() < 2 {
+            continue;
+        }
+        let entry_arr = entry_arr.unwrap();
+        if let Some(&idx) = struct_def.field_map.get(&fid) {
+            let field = &struct_def.fields[idx];
+            let py_val = json_value_to_py(&entry_arr[1], &field.field_type, &struct_def.struct_map, py)?;
+            cache.insert(field.name.clone(), py_val);
+        }
+    }
+
+    Ok(Bound::new(
+        py,
+        ThriftStructInstance::from_python_cache(
+            struct_def.name.clone(),
+            Arc::clone(&struct_def.field_names_arc),
+            cache,
+            Arc::clone(&struct_def.schema_arc),
+            Arc::clone(&struct_def.struct_map),
+        ),
+    )?)
 }
 
 /// Best-effort conversion of an arbitrary Python object to a `ThriftValue`

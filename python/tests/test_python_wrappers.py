@@ -30,9 +30,9 @@ def test_thrift_field_repr_includes_name(all_types_module):
     assert "flag" in repr(all_types_module.AllTypes.fields[0])
 
 
-def test_new_instance_defaults_all_fields_to_none(all_types_module):
+def test_new_instance_applies_schema_defaults(all_types_module):
     instance = all_types_module.Child.new_instance()
-    assert instance.to_dict() == {"name": None}
+    assert instance.to_dict() == {"name": "default"}
 
 
 def test_struct_call_builds_instance(all_types_module):

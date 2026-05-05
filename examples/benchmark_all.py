@@ -27,7 +27,7 @@ import thriftpy2
 from thriftpy2.protocol import TJSONProtocolFactory
 from thriftpy2.rpc import make_client as tp2_make_client
 from thriftpy2.rpc import make_server as tp2_make_server
-from thriftpy2.transport import TCyBufferedTransportFactory
+from thriftpy2.transport import TCyBufferedTransportFactory, TFramedTransportFactory
 from thriftpy2.utils import deserialize as tp2_deserialize
 from thriftpy2.utils import serialize as tp2_serialize
 
@@ -71,10 +71,20 @@ struct ComplexProfile {
     7: optional string note;
 }
 
+struct BatchReport {
+    1: required i64 id;
+    2: required string title;
+    3: required list<ComplexProfile> profiles;
+    4: required map<string, double> metrics;
+    5: required binary extra;
+}
+
 service BenchService {
     SimpleUser get_simple(1: i32 user_id);
     ComplexProfile get_complex(1: i32 user_id);
     bool save_complex(1: ComplexProfile profile);
+    BatchReport get_batch(1: i32 batch_id);
+    bool save_batch(1: BatchReport report);
 }
 """
 
@@ -87,6 +97,7 @@ class RpcConfig:
     rs_transport: Any
     compare_thriftpy2: bool
     tp2_proto_factory: Callable[[], Any] | None = None
+    tp2_transport: Any = TCyBufferedTransportFactory
 
 
 @dataclass
@@ -150,6 +161,20 @@ def make_complex_data(index: int = 1) -> dict[str, Any]:
     }
 
 
+def make_large_data(index: int = 1, profile_count: int = 10) -> dict[str, Any]:
+    return {
+        "id": index,
+        "title": f"batch-report-{index}",
+        "profiles": [make_complex_data(i + 1) for i in range(profile_count)],
+        "metrics": {f"metric_{k}": float(k) * 1.5 for k in range(50)},
+        "extra": b"x" * 512,
+    }
+
+
+def make_xlarge_data(index: int = 1, profile_count: int = 100) -> dict[str, Any]:
+    return make_large_data(index, profile_count)
+
+
 def tp2_simple(mod: Any, data: dict[str, Any]) -> Any:
     return mod.SimpleUser(**data)
 
@@ -163,6 +188,16 @@ def tp2_complex(mod: Any, data: dict[str, Any]) -> Any:
         events=[mod.Event(**item) for item in data["events"]],
         payload=data["payload"],
         note=data["note"],
+    )
+
+
+def tp2_batch(mod: Any, data: dict[str, Any]) -> Any:
+    return mod.BatchReport(
+        id=data["id"],
+        title=data["title"],
+        profiles=[tp2_complex(mod, p) for p in data["profiles"]],
+        metrics=data["metrics"],
+        extra=data["extra"],
     )
 
 
@@ -284,6 +319,20 @@ def run_json_matrix(rs_mod: Any, tp2_mod: Any, iterations: int, warmup: int) -> 
             tp2_mod.ComplexProfile,
             tp2_complex(tp2_mod, make_complex_data()),
         ),
+        (
+            "large",
+            rs_mod.BatchReport,
+            make_large_data(),
+            tp2_mod.BatchReport,
+            tp2_batch(tp2_mod, make_large_data()),
+        ),
+        (
+            "xlarge",
+            rs_mod.BatchReport,
+            make_xlarge_data(),
+            tp2_mod.BatchReport,
+            tp2_batch(tp2_mod, make_xlarge_data()),
+        ),
     ]
     tp2_json = TJSONProtocolFactory()
     rows: list[LoopStats] = []
@@ -347,6 +396,7 @@ def loop_stats(
 
 def make_rs_handler(rs_mod: Any) -> Any:
     complex_profile = rs_mod.ComplexProfile(**make_complex_data(7))
+    large_report = rs_mod.BatchReport(**make_large_data(7))
 
     class Handler:
         def get_simple(self, user_id: int):
@@ -359,11 +409,19 @@ def make_rs_handler(rs_mod: Any) -> Any:
         def save_complex(self, profile: Any):
             return profile.user.id > 0 and len(profile.addresses) > 0
 
+        def get_batch(self, batch_id: int):
+            _ = batch_id
+            return large_report
+
+        def save_batch(self, report: Any):
+            return report.id > 0 and len(report.profiles) > 0
+
     return Handler()
 
 
 def make_tp2_handler(tp2_mod: Any) -> Any:
     complex_profile = tp2_complex(tp2_mod, make_complex_data(7))
+    large_report = tp2_batch(tp2_mod, make_large_data(7))
 
     class Handler:
         def get_simple(self, user_id: int):
@@ -376,6 +434,13 @@ def make_tp2_handler(tp2_mod: Any) -> Any:
         def save_complex(self, profile: Any):
             return profile.user.id > 0 and len(profile.addresses) > 0
 
+        def get_batch(self, batch_id: int):
+            _ = batch_id
+            return large_report
+
+        def save_batch(self, report: Any):
+            return report.id > 0 and len(report.profiles) > 0
+
     return Handler()
 
 
@@ -387,8 +452,8 @@ def rpc_configs(include_framed: bool) -> list[RpcConfig]:
     if include_framed:
         configs.extend(
             [
-                RpcConfig("binary", "framed", ProtocolType.Binary, TFramedTransport.transport_type, False),
-                RpcConfig("json", "framed", ProtocolType.JSON, TFramedTransport.transport_type, False),
+                RpcConfig("binary", "framed", ProtocolType.Binary, TFramedTransport.transport_type, True, tp2_transport=TFramedTransportFactory),
+                RpcConfig("json", "framed", ProtocolType.JSON, TFramedTransport.transport_type, True, TJSONProtocolFactory, tp2_transport=TFramedTransportFactory),
             ]
         )
     return configs
@@ -436,7 +501,7 @@ def run_rpc_config(
         tp2_kwargs: dict[str, Any] = {
             "host": host,
             "port": tp2_port,
-            "trans_factory": TCyBufferedTransportFactory(),
+            "trans_factory": config.tp2_transport(),
         }
         if config.tp2_proto_factory is not None:
             tp2_kwargs["proto_factory"] = config.tp2_proto_factory()
@@ -457,8 +522,16 @@ def run_rpc_config(
                 lambda client: (lambda: client.call("get_complex", user_id=11)),
             ),
             (
+                "get_batch",
+                lambda client: (lambda: client.call("get_batch", batch_id=13)),
+            ),
+            (
                 "save_complex",
                 lambda client: make_rs_save_complex_call(rs_mod, client),
+            ),
+            (
+                "save_batch",
+                lambda client: make_rs_save_batch_call(rs_mod, client),
             ),
         ]
         for method, call_factory in rs_methods:
@@ -476,7 +549,9 @@ def run_rpc_config(
             tp2_methods = [
                 ("get_simple", lambda client: (lambda: client.get_simple(11))),
                 ("get_complex", lambda client: (lambda: client.get_complex(11))),
+                ("get_batch", lambda client: (lambda: client.get_batch(13))),
                 ("save_complex", lambda client: make_tp2_save_complex_call(tp2_mod, client)),
+                ("save_batch", lambda client: make_tp2_save_batch_call(tp2_mod, client)),
             ]
             for method, call_factory in tp2_methods:
                 total, latencies = measure_rpc_concurrent(
@@ -500,7 +575,7 @@ def run_rpc_config(
 
 def make_tp2_client(tp2_mod: Any, host: str, port: int, config: RpcConfig) -> Any:
     kwargs: dict[str, Any] = {
-        "trans_factory": TCyBufferedTransportFactory(),
+        "trans_factory": config.tp2_transport(),
     }
     if config.tp2_proto_factory is not None:
         kwargs["proto_factory"] = config.tp2_proto_factory()
@@ -512,9 +587,19 @@ def make_rs_save_complex_call(rs_mod: Any, client: Any) -> Callable[[], Any]:
     return lambda: client.call("save_complex", profile=profile)
 
 
+def make_rs_save_batch_call(rs_mod: Any, client: Any) -> Callable[[], Any]:
+    report = rs_mod.BatchReport(**make_large_data(11))
+    return lambda: client.call("save_batch", report=report)
+
+
 def make_tp2_save_complex_call(tp2_mod: Any, client: Any) -> Callable[[], Any]:
     profile = tp2_complex(tp2_mod, make_complex_data(11))
     return lambda: client.save_complex(profile)
+
+
+def make_tp2_save_batch_call(tp2_mod: Any, client: Any) -> Callable[[], Any]:
+    report = tp2_batch(tp2_mod, make_large_data(11))
+    return lambda: client.save_batch(report)
 
 
 def close_tp2_client(client: Any) -> None:
@@ -561,13 +646,64 @@ def rpc_stats(
     )
 
 
+def aggregate_loop_rows(rows: list[LoopStats]) -> list[LoopStats]:
+    groups: dict[tuple[str, str, str, str, int | None], list[LoopStats]] = {}
+    for row in rows:
+        groups.setdefault(
+            (row.library, row.shape, row.operation, row.protocol, row.payload_bytes), []
+        ).append(row)
+
+    aggregated = []
+    for (library, shape, operation, protocol, payload_bytes), group in groups.items():
+        iterations = group[0].iterations
+        avg_total_s = statistics.mean(row.total_s for row in group)
+        aggregated.append(
+            loop_stats(library, shape, operation, protocol, iterations, avg_total_s, payload_bytes)
+        )
+    return aggregated
+
+
+def aggregate_rpc_rows(rows: list[RpcStats]) -> list[RpcStats]:
+    groups: dict[tuple[str, str, str, str, int], list[RpcStats]] = {}
+    for row in rows:
+        groups.setdefault(
+            (row.library, row.method, row.protocol, row.transport, row.concurrency), []
+        ).append(row)
+
+    aggregated = []
+    for (library, method, protocol, transport, concurrency), group in groups.items():
+        iterations = group[0].iterations
+        avg_total_s = statistics.mean(row.total_s for row in group)
+        avg_ms = statistics.mean(row.avg_ms for row in group)
+        p50_ms = statistics.mean(row.p50_ms for row in group)
+        p90_ms = statistics.mean(row.p90_ms for row in group)
+        p99_ms = statistics.mean(row.p99_ms for row in group)
+        aggregated.append(
+            RpcStats(
+                library=library,
+                method=method,
+                protocol=protocol,
+                transport=transport,
+                concurrency=concurrency,
+                iterations=iterations,
+                total_s=avg_total_s,
+                avg_ms=avg_ms,
+                p50_ms=p50_ms,
+                p90_ms=p90_ms,
+                p99_ms=p99_ms,
+                ops_per_s=iterations / avg_total_s if avg_total_s else float("inf"),
+            )
+        )
+    return aggregated
+
+
 def print_json_matrix(rows: list[LoopStats]) -> None:
     print("\nJSON serialization/deserialization matrix")
     print("-" * 104)
     print(f"{'shape':<9} {'op':<12} {'library':<10} {'payload':>8} {'avg us':>12} {'ops/s':>14} {'ratio vs tp2':>14}")
     print("-" * 104)
     by_key = {(row.shape, row.operation, row.library): row for row in rows}
-    for shape in ("simple", "complex"):
+    for shape in ("simple", "complex", "large", "xlarge"):
         for op in ("serialize", "deserialize"):
             tp2 = by_key[(shape, op, "thriftpy2")]
             for library in ("thriftrs2", "thriftpy2"):
@@ -594,7 +730,7 @@ def print_rpc_matrix(rows: list[RpcStats]) -> None:
     }
     config_keys = sorted({(row.protocol, row.transport, row.concurrency) for row in rows})
     for protocol, transport, concurrency in config_keys:
-        for method in ("get_simple", "get_complex", "save_complex"):
+        for method in ("get_simple", "get_complex", "get_batch", "save_complex", "save_batch"):
             tp2 = by_key.get((protocol, transport, concurrency, method, "thriftpy2"))
             for library in ("thriftrs2", "thriftpy2"):
                 row = by_key.get((protocol, transport, concurrency, method, library))
@@ -621,16 +757,26 @@ def parse_concurrency(values: list[int]) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run thriftrs2 vs thriftpy2 benchmark matrix")
-    parser.add_argument("--ser-iterations", type=int, default=5_000, help="iterations per JSON serialize/deserialize row")
+    parser.add_argument("--ser-iterations", type=int, default=500, help="iterations per JSON serialize/deserialize row")
     parser.add_argument("--rpc-iterations", type=int, default=1_000, help="iterations per RPC row")
-    parser.add_argument("--warmup", type=int, default=200, help="warmup iterations per row")
+    parser.add_argument("--warmup", type=int, default=50, help="warmup iterations per row")
     parser.add_argument("--host", default="127.0.0.1", help="RPC bind/connect host")
-    parser.add_argument("--rpc-concurrency", type=int, nargs="+", default=[1, 4], help="client concurrency levels for RPC rows")
+    parser.add_argument("--rpc-concurrency", type=int, nargs="+", default=[1, 4, 16, 64, 128], help="client concurrency levels for RPC rows")
+    parser.add_argument("--runs", type=int, default=1, help="repeat the benchmark and report averaged rows")
+    parser.add_argument("--ci-smoke", action="store_true", help="small stable matrix intended for CI smoke checks")
     parser.add_argument("--skip-framed-rpc", action="store_true", help="skip thriftrs2 framed RPC rows")
     parser.add_argument("--skip-rpc", action="store_true", help="skip RPC matrix")
     parser.add_argument("--output-json", type=Path, help="optional path to write machine-readable results")
     args = parser.parse_args()
 
+    if args.ci_smoke:
+        args.ser_iterations = 200
+        args.rpc_iterations = 50
+        args.warmup = 10
+        args.rpc_concurrency = [1]
+        args.skip_framed_rpc = True
+
+    args.runs = max(1, args.runs)
     concurrencies = parse_concurrency(args.rpc_concurrency)
 
     with tempfile.TemporaryDirectory(prefix="thriftrs2-bench-") as tmp:
@@ -643,25 +789,47 @@ def main() -> None:
         print(f"RPC iterations per row: {args.rpc_iterations if not args.skip_rpc else 0}")
         print(f"Warmup per row: {args.warmup}")
         print(f"RPC concurrency levels: {concurrencies if not args.skip_rpc else []}")
+        print(f"Runs: {args.runs}")
+        if args.ci_smoke:
+            print("Mode: CI smoke")
 
-        json_rows = run_json_matrix(rs_mod, tp2_mod, args.ser_iterations, args.warmup)
+        json_rows_raw: list[LoopStats] = []
+        rpc_rows_raw: list[RpcStats] = []
+        for run_index in range(args.runs):
+            if args.runs > 1:
+                print(f"\nRun {run_index + 1}/{args.runs}")
+            json_rows_raw.extend(run_json_matrix(rs_mod, tp2_mod, args.ser_iterations, args.warmup))
+            if not args.skip_rpc:
+                rpc_rows_raw.extend(
+                    run_rpc_matrix(
+                        rs_mod,
+                        tp2_mod,
+                        args.rpc_iterations,
+                        args.warmup,
+                        args.host,
+                        concurrencies,
+                        include_framed=not args.skip_framed_rpc,
+                    )
+                )
+
+        json_rows = aggregate_loop_rows(json_rows_raw)
         print_json_matrix(json_rows)
 
-        rpc_rows: list[RpcStats] = []
-        if not args.skip_rpc:
-            rpc_rows = run_rpc_matrix(
-                rs_mod,
-                tp2_mod,
-                args.rpc_iterations,
-                args.warmup,
-                args.host,
-                concurrencies,
-                include_framed=not args.skip_framed_rpc,
-            )
+        rpc_rows = aggregate_rpc_rows(rpc_rows_raw)
+        if rpc_rows:
             print_rpc_matrix(rpc_rows)
 
         if args.output_json:
             payload = {
+                "metadata": {
+                    "ser_iterations": args.ser_iterations,
+                    "rpc_iterations": args.rpc_iterations if not args.skip_rpc else 0,
+                    "warmup": args.warmup,
+                    "rpc_concurrency": concurrencies if not args.skip_rpc else [],
+                    "runs": args.runs,
+                    "ci_smoke": args.ci_smoke,
+                    "framed_rpc": not args.skip_framed_rpc and not args.skip_rpc,
+                },
                 "json": [asdict(row) for row in json_rows],
                 "rpc": [asdict(row) for row in rpc_rows],
             }

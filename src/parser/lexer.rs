@@ -37,6 +37,7 @@ fn keyword_or_identifier(ident: String) -> Token {
     match ident.as_str() {
         "struct" | "service" | "required" | "optional" | "oneway" | "include" | "namespace"
         | "typedef" | "enum" | "const" | "throws" | "exception" => Token::Keyword(ident),
+        "union" | "extends" => Token::Keyword(ident),
         _ => Token::Identifier(ident),
     }
 }
@@ -183,7 +184,8 @@ mod tests {
     #[test]
     fn tokenizes_compatibility_keywords() {
         let (_, tokens) =
-            tokenize("include namespace typedef enum const throws exception *").unwrap();
+            tokenize("include namespace typedef enum const throws exception union extends *")
+                .unwrap();
         assert_eq!(tokens[0], Token::Keyword("include".to_string()));
         assert_eq!(tokens[1], Token::Keyword("namespace".to_string()));
         assert_eq!(tokens[2], Token::Keyword("typedef".to_string()));
@@ -191,7 +193,9 @@ mod tests {
         assert_eq!(tokens[4], Token::Keyword("const".to_string()));
         assert_eq!(tokens[5], Token::Keyword("throws".to_string()));
         assert_eq!(tokens[6], Token::Keyword("exception".to_string()));
-        assert_eq!(tokens[7], Token::Asterisk);
+        assert_eq!(tokens[7], Token::Keyword("union".to_string()));
+        assert_eq!(tokens[8], Token::Keyword("extends".to_string()));
+        assert_eq!(tokens[9], Token::Asterisk);
     }
 
     #[test]

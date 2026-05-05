@@ -11,6 +11,7 @@ It provides:
 - dynamic struct/service access from parsed `.thrift` files
 - fast serialization/deserialization helpers
 - RPC client and server utilities
+- practical thriftpy2 interop checks and benchmark tooling
 
 ## 2. Installation
 
@@ -44,6 +45,26 @@ print(mod.UserService)
 ```
 
 `load()` returns a module-like object exposing parsed structs and services as attributes.
+
+The loader supports `include_dirs` and common IDL features used by thriftpy2-style schemas:
+
+- `include` and qualified references such as `common.User`
+- `namespace`
+- `typedef`
+- `enum` constants exposed as module attributes
+- `const` declarations
+- `exception` and service `throws`
+- `union`
+- annotations, which are parsed and ignored
+- field defaults
+- `struct extends` and `service extends` inheritance when the parent is parsed first
+
+Example:
+
+```python
+mod = load("service.thrift", include_dirs=["idl"])
+assert mod.Status.OK == 1
+```
 
 ## 4. Struct serialization and deserialization
 
@@ -92,6 +113,14 @@ from thriftrs2 import dumps, loads
 text = dumps(mod.User, user)
 round_trip = loads(mod.User, text)
 ```
+
+JSON deserialization accepts two input dialects:
+
+- thriftrs2's TJSON field-id object format
+- thriftpy2 `utils` TJSON envelopes with a 4-byte length prefix and `metadata`/`payload`
+
+The reverse direction is intentionally tracked as an interop gap: `thriftrs2`
+does not yet emit thriftpy2's metadata envelope.
 
 RPC helpers also accept `protocol=...`. The client and server must agree on
 the same protocol:
@@ -160,6 +189,12 @@ server = make_server(
 server.serve_forever("127.0.0.1", 9090)
 ```
 
+Declared exceptions can be returned over RPC when a handler raises a Python
+exception whose class name matches a `throws` exception struct. The client
+decodes the declared exception payload using the service schema and raises a
+Python `RuntimeError` containing the decoded value. A dedicated exception type
+is planned but not part of the current API.
+
 ## 8. Repository examples
 
 After installing the package into your environment, these examples should work directly:
@@ -169,6 +204,7 @@ python examples/test.py
 python examples/test_protocols.py
 python examples/server_example.py
 python examples/client_example.py
+python examples/benchmark_all.py --ci-smoke
 ```
 
 ## 9. Development workflow
@@ -179,9 +215,26 @@ Recommended local workflow:
 cargo check
 maturin develop --release
 python -m pytest -q
+cargo test
 python examples/test.py
 python examples/test_protocols.py
+python examples/benchmark_all.py --ci-smoke
 ```
+
+For a fuller local performance run against thriftpy2:
+
+```bash
+python examples/benchmark_all.py \
+    --ser-iterations 10000 \
+    --rpc-iterations 1000 \
+    --warmup 300 \
+    --rpc-concurrency 1 4 \
+    --runs 3 \
+    --output-json target/benchmark_all_results.json
+```
+
+Benchmark ratio columns use thriftpy2 as `1.00x`; values greater than `1.00x`
+mean `thriftrs2` is faster for that row.
 
 ## 10. Release checklist
 
@@ -196,10 +249,15 @@ Before publishing to PyPI:
    maturin develop --release
    ```
 4. Run tests:
-   ```bash
-   python -m pytest -q
-   cargo check
-   ```
+
+```bash
+python -m pytest -q
+cargo test
+cargo check
+```
+
+The current suite includes one expected JSON interop xfail for the direction
+where thriftpy2 reads thriftrs2 JSON output.
 5. Tag and push (triggers CI wheels + optional PyPI upload), e.g. `v0.1.0`.
 
 Manual build (without CI):

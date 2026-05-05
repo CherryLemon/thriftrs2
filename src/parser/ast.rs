@@ -39,6 +39,12 @@ pub struct ThriftService {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThriftEnum {
+    pub name: String,
+    pub variants: HashMap<String, i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThriftMethod {
     pub name: String,
     pub return_type: ThriftType,
@@ -70,6 +76,7 @@ pub enum ThriftValue {
 pub struct ThriftDocument {
     pub structs: HashMap<String, ThriftStruct>,
     pub services: HashMap<String, ThriftService>,
+    pub enums: HashMap<String, ThriftEnum>,
     pub includes: Vec<String>,
     pub namespaces: HashMap<String, String>,
 }

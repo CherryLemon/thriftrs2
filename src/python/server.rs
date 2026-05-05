@@ -1,6 +1,7 @@
 // ──────────────────────────────────────────────────────────────────────────────
 // server.rs  –  ThriftServer and connection-handling logic (tokio async)
 // ──────────────────────────────────────────────────────────────────────────────
+use crate::parser::ast::{ThriftType, ThriftValue};
 use crate::protocol::{
     BinaryProtocolReader, BinaryProtocolWriter, CompactProtocolReader, CompactProtocolWriter,
     FieldBegin, JSONProtocolReader, JSONProtocolWriter, MessageBegin, TInputProtocol,
@@ -178,6 +179,67 @@ impl RegisteredHandler {
             callable: self.callable.clone_ref(py),
             is_async: self.is_async,
         }
+    }
+}
+
+enum CallOutcome {
+    Sync(Vec<u8>),
+    Async(Py<PyAny>),
+}
+
+fn invoke_python_handler(
+    py: Python<'_>,
+    method: &PyThriftMethod,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+    handlers: &HashMap<String, RegisteredHandler>,
+    method_name: &str,
+    args_values: &HashMap<String, ThriftValue>,
+    protocol: ProtocolType,
+    seq_id: i32,
+) -> PyResult<CallOutcome> {
+    let handler_entry = handlers.get(method_name).expect("handler checked above");
+    let handler = handler_entry.callable.clone_ref(py);
+
+    let kwargs = PyDict::new(py);
+    for field in &method.arguments {
+        if let Some(value) = args_values.get(&field.name) {
+            let py_value = thrift_value_to_py(value, py, struct_map)?;
+            kwargs.set_item(&field.name, py_value.bind(py))?;
+        } else {
+            kwargs.set_item(&field.name, py.None())?;
+        }
+    }
+
+    let call_result = match handler.call(py, (), Some(&kwargs)) {
+        Ok(call_result) => call_result,
+        Err(err) => {
+            if let Some(reply) = try_build_declared_exception_reply(
+                py,
+                &err,
+                method,
+                struct_map,
+                protocol,
+                method_name,
+                seq_id,
+            )? {
+                return Ok(CallOutcome::Sync(reply));
+            }
+            return Err(err);
+        }
+    };
+    if handler_entry.is_async {
+        Ok(CallOutcome::Async(call_result))
+    } else {
+        let reply_body = build_reply_body(
+            py,
+            &method.return_type,
+            call_result.bind(py),
+            struct_map,
+            protocol,
+            method_name,
+            seq_id,
+        )?;
+        Ok(CallOutcome::Sync(reply_body))
     }
 }
 
@@ -492,61 +554,51 @@ async fn handle_connection(
                 let method_name = msg_begin.name.clone();
                 let seq_id = msg_begin.seq_id;
 
-                enum CallOutcome {
-                    /// Sync handler returned a value directly.
-                    Sync(Vec<u8>),
-                    /// Async handler; yields a coroutine to drive via tokio.
-                    Async(Py<PyAny>),
-                }
+                let handler_is_async = handlers2
+                    .get(&method_name)
+                    .map(|handler| handler.is_async)
+                    .unwrap_or(false);
 
-                let outcome: Result<CallOutcome, String> = tokio::task::spawn_blocking({
-                    let method = method.clone();
-                    let struct_map2 = Arc::clone(&struct_map2);
-                    let handlers2 = Arc::clone(&handlers2);
-                    let method_name = method_name.clone();
-                    let args_values = args_values;
-                    move || {
-                        Python::attach(|py| {
-                            let handler_entry =
-                                handlers2.get(&method_name).expect("handler checked above");
-                            let handler = handler_entry.callable.clone_ref(py);
-                            let is_async_fn = handler_entry.is_async;
-
-                            let kwargs = PyDict::new(py);
-                            for field in &method.arguments {
-                                if let Some(value) = args_values.get(&field.name) {
-                                    let py_value = thrift_value_to_py(value, py, &struct_map2)?;
-                                    kwargs.set_item(&field.name, py_value.bind(py))?;
-                                } else {
-                                    kwargs.set_item(&field.name, py.None())?;
-                                }
-                            }
-
-                            let call_result = handler.call(py, (), Some(&kwargs))?;
-
-                            if is_async_fn {
-                                // Return the coroutine object; we'll drive it
-                                // natively on the tokio task via pyo3-async-runtimes.
-                                Ok::<CallOutcome, PyErr>(CallOutcome::Async(call_result))
-                            } else {
-                                // Sync handler: build reply immediately.
-                                let reply_body = build_reply_body(
+                let outcome: Result<CallOutcome, String> = if handler_is_async {
+                    tokio::task::spawn_blocking({
+                        let method = method.clone();
+                        let struct_map2 = Arc::clone(&struct_map2);
+                        let handlers2 = Arc::clone(&handlers2);
+                        let method_name = method_name.clone();
+                        let args_values = args_values.clone();
+                        move || {
+                            Python::attach(|py| {
+                                invoke_python_handler(
                                     py,
-                                    &method.return_type,
-                                    call_result.bind(py),
+                                    &method,
                                     &struct_map2,
-                                    protocol,
+                                    &handlers2,
                                     &method_name,
+                                    &args_values,
+                                    protocol,
                                     seq_id,
-                                )?;
-                                Ok(CallOutcome::Sync(reply_body))
-                            }
-                        })
-                        .map_err(|e: PyErr| e.to_string())
-                    }
-                })
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()));
+                                )
+                            })
+                            .map_err(|e: PyErr| e.to_string())
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+                } else {
+                    Python::attach(|py| {
+                        invoke_python_handler(
+                            py,
+                            &method,
+                            &struct_map2,
+                            &handlers2,
+                            &method_name,
+                            &args_values,
+                            protocol,
+                            seq_id,
+                        )
+                    })
+                    .map_err(|e: PyErr| e.to_string())
+                };
 
                 let result: Result<Vec<u8>, String> = match outcome {
                     Err(e) => Err(e),
@@ -891,8 +943,6 @@ where
 // Reply builders
 // ──────────────────────────────────────────────────────────────────────────────
 
-use crate::parser::ast::ThriftType;
-
 fn build_reply_body(
     _py: Python<'_>,
     return_type: &ThriftType,
@@ -975,6 +1025,138 @@ fn write_reply_frame<P: TOutputProtocol>(
         }
     }
 
+    writer
+        .write_field_stop()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    writer
+        .write_message_end()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    Ok(())
+}
+
+fn try_build_declared_exception_reply(
+    py: Python<'_>,
+    err: &PyErr,
+    method: &PyThriftMethod,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+    protocol: ProtocolType,
+    method_name: &str,
+    seq_id: i32,
+) -> PyResult<Option<Vec<u8>>> {
+    let err_value = err.value(py);
+    let type_name = err_value.get_type().name()?.to_string();
+
+    for exception_field in &method.exceptions {
+        let ThriftType::Struct(struct_name) = &exception_field.field_type else {
+            continue;
+        };
+        let local_name = struct_name
+            .rsplit('.')
+            .next()
+            .unwrap_or(struct_name.as_str());
+        if type_name != *struct_name && type_name != local_name {
+            continue;
+        }
+
+        let exception_payload = PyDict::new(py);
+        if let Some(struct_def) = struct_map.get(struct_name) {
+            for field in &struct_def.fields {
+                if err_value.hasattr(&field.name)? {
+                    exception_payload.set_item(&field.name, err_value.getattr(&field.name)?)?;
+                }
+            }
+            if exception_payload.is_empty() && struct_def.fields.len() == 1 {
+                exception_payload.set_item(&struct_def.fields[0].name, err.to_string())?;
+            }
+        }
+
+        return build_declared_exception_reply(
+            protocol,
+            method_name,
+            seq_id,
+            exception_field,
+            exception_payload.as_any(),
+            struct_map,
+        )
+        .map(Some);
+    }
+
+    Ok(None)
+}
+
+fn build_declared_exception_reply(
+    protocol: ProtocolType,
+    method_name: &str,
+    seq_id: i32,
+    exception_field: &super::types::ThriftField,
+    value: &Bound<'_, PyAny>,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> PyResult<Vec<u8>> {
+    let mut buf = Vec::with_capacity(128);
+    match protocol {
+        ProtocolType::Binary => {
+            let mut writer = BinaryProtocolWriter::new(&mut buf);
+            write_declared_exception_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                exception_field,
+                value,
+                struct_map,
+            )?;
+        }
+        ProtocolType::Compact => {
+            let mut writer = CompactProtocolWriter::new(&mut buf);
+            write_declared_exception_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                exception_field,
+                value,
+                struct_map,
+            )?;
+        }
+        ProtocolType::JSON => {
+            let mut writer = JSONProtocolWriter::new(&mut buf);
+            write_declared_exception_frame(
+                &mut writer,
+                method_name,
+                seq_id,
+                exception_field,
+                value,
+                struct_map,
+            )?;
+        }
+    }
+    Ok(buf)
+}
+
+fn write_declared_exception_frame<P: TOutputProtocol>(
+    writer: &mut P,
+    method_name: &str,
+    seq_id: i32,
+    exception_field: &super::types::ThriftField,
+    value: &Bound<'_, PyAny>,
+    struct_map: &HashMap<String, ThriftStruct>,
+) -> PyResult<()> {
+    writer
+        .write_message_begin(&MessageBegin {
+            name: method_name.to_string(),
+            message_type: MESSAGE_TYPE_REPLY,
+            seq_id,
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    writer
+        .write_field_begin(&FieldBegin {
+            name: None,
+            field_type: thrift_type_to_ttype(&exception_field.field_type),
+            id: exception_field.id,
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+    write_value_with_structs(writer, &exception_field.field_type, value, struct_map)?;
+    writer
+        .write_field_end()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
     writer
         .write_field_stop()
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;

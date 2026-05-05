@@ -18,6 +18,7 @@ class ThriftModule:
         self._parser = parser
         self._structs = {}
         self._services = {}
+        self._enums = {}
         self._load_definitions()
 
     def _load_definitions(self):
@@ -35,12 +36,38 @@ class ThriftModule:
             if service_def:
                 self._services[service_name] = service_def
 
+        if hasattr(self._parser, "list_enums"):
+            for enum_name in self._parser.list_enums():
+                enum_values = self._parser.get_enum(enum_name)
+                enum_def = ThriftEnum(enum_name, enum_values or {})
+                self._enums[enum_name] = enum_def
+                setattr(self, enum_name, enum_def)
+
     def __getattr__(self, name: str):
         if name in self._structs:
             return self._structs[name]
         if name in self._services:
             return ThriftService(self._parser, self._services[name])
+        if name in self._enums:
+            return self._enums[name]
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+
+
+class ThriftEnum:
+    def __init__(self, name: str, values: dict[str, int]):
+        self.name = name
+        self._values = dict(values)
+        for item_name, item_value in self._values.items():
+            setattr(self, item_name, item_value)
+
+    def __getitem__(self, name: str) -> int:
+        return self._values[name]
+
+    def to_dict(self) -> dict[str, int]:
+        return dict(self._values)
+
+    def __repr__(self):
+        return f"<ThriftEnum {self.name} {self._values}>"
 
 
 class ThriftService:

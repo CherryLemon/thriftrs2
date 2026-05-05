@@ -63,6 +63,25 @@ def test_load_resolves_included_structs(tmp_path):
     assert instance.to_dict() == {"value": {"name": "from-include"}}
 
 
+def test_extends_merges_struct_fields_and_service_methods():
+    module = load_fp(
+        StringIO(
+            """
+            struct Base { 1: optional string id = "base"; }
+            struct Child extends Base { 2: required string name; }
+            service BaseService { string ping(); }
+            service ChildService extends BaseService { string echo(1: string value); }
+            """
+        ),
+        "inline_extends",
+    )
+
+    assert module.Child(name="Ada").to_dict() == {"id": "base", "name": "Ada"}
+    service = module.ChildService.service_def
+    assert service.get_method("ping").name == "ping"
+    assert service.get_method("echo").name == "echo"
+
+
 def test_load_fp_loads_file_like_object():
     module = load_fp(StringIO("struct Item { 1: required string name; }"), "inline")
     assert module.name == "inline"
@@ -161,12 +180,39 @@ def test_parse_typedef_enum_const_exception_and_throws():
         """
     )
 
+    assert parser.list_enums() == ["Status"]
+    assert parser.get_enum("Status") == {"OK": 1, "FAILED": 2}
     event_fields = {field.name: field for field in parser.get_struct("Event").fields}
     assert "I64" in repr(event_fields["created_at"])
     assert "I32" in repr(event_fields["status"])
     assert "List" in repr(event_fields["ids"])
     method = parser.get_service("Events").get_method("get")
     assert method.exceptions[0].name == "missing"
+
+
+def test_module_exposes_enum_union_annotations_and_defaults():
+    module = load_fp(
+        StringIO(
+            """
+            enum Status { OK = 1, FAILED = 2 }
+            union Choice (scope="test") {
+                1: optional Status status = Status.OK;
+                2: optional string label = "fallback" (ui.hidden="true");
+                3: optional list<i32> ids = [1, 2, 3];
+            }
+            """
+        ),
+        "inline_defaults",
+    )
+
+    assert module.Status.OK == 1
+    assert module.Status["FAILED"] == 2
+    instance = module.Choice()
+    assert instance.to_dict() == {"status": 1, "label": "fallback", "ids": [1, 2, 3]}
+
+    encoded = thriftrs2.serialize(module.Choice, {}, proto=thriftrs2.ProtocolType.JSON)
+    decoded = thriftrs2.deserialize(module.Choice, encoded, proto=thriftrs2.ProtocolType.JSON)
+    assert decoded == {"status": 1, "label": "fallback", "ids": [1, 2, 3]}
 
 
 def test_parse_invalid_field_id_raises_value_error():

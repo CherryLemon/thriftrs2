@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from io import StringIO
+
 import pytest
 
 import thriftrs2
+from thriftrs2.loader import load_fp
 
 
 pytestmark = pytest.mark.rpc
@@ -227,4 +230,51 @@ def test_rpc_server_running_flag_changes(service_module, free_tcp_port):
     try:
         assert server._server.is_running() is True
     finally:
+        server._server.stop()
+
+
+@pytest.mark.parametrize("protocol", [thriftrs2.ProtocolType.Binary, thriftrs2.ProtocolType.JSON])
+def test_rpc_declared_exception_round_trip(free_tcp_port, protocol):
+    module = load_fp(
+        StringIO(
+            """
+            exception NotFound { 1: string message; }
+            service Lookup { string get(1: i32 id) throws (1: NotFound missing); }
+            """
+        ),
+        "lookup",
+    )
+
+    class NotFound(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+            self.message = message
+
+    class Handler:
+        def get(self, id):
+            raise NotFound(f"missing-{id}")
+
+    server = thriftrs2.make_server(
+        module.Lookup,
+        Handler(),
+        transport=thriftrs2.TransportType.Buffered,
+        protocol=protocol,
+        workers=2,
+    )
+    server.serve_forever("127.0.0.1", free_tcp_port, blocking=False)
+    client = None
+    try:
+        client = thriftrs2.make_client(
+            module.Lookup,
+            "127.0.0.1",
+            free_tcp_port,
+            transport=thriftrs2.TransportType.Buffered,
+            protocol=protocol,
+        )
+        with pytest.raises(RuntimeError, match="missing") as exc_info:
+            client.call("get", id=7)
+        assert "missing-7" in str(exc_info.value)
+    finally:
+        if client is not None:
+            client.close()
         server._server.stop()

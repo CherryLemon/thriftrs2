@@ -2,8 +2,10 @@
 // types.rs  –  Python-visible Thrift type wrappers
 // ──────────────────────────────────────────────────────────────────────────────
 use crate::parser::ast::*;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,6 +25,7 @@ pub struct ThriftField {
     #[pyo3(get)]
     pub required: bool,
     pub(crate) field_type: ThriftType,
+    pub(crate) default_value: Option<ThriftValue>,
 }
 
 #[pymethods]
@@ -61,12 +64,7 @@ pub struct ThriftStruct {
 impl ThriftStruct {
     /// Construct an empty ThriftStructInstance with all fields set to None.
     pub fn new_instance(&self, _py: Python<'_>) -> ThriftStructInstance {
-        ThriftStructInstance::empty(
-            self.name.clone(),
-            Arc::clone(&self.field_names_arc),
-            Arc::clone(&self.schema_arc),
-            Arc::clone(&self.struct_map),
-        )
+        self.new_instance_with_defaults()
     }
 
     pub fn new_instance_from_dict(
@@ -74,12 +72,7 @@ impl ThriftStruct {
         py: Python<'_>,
         items: &Bound<'_, PyDict>,
     ) -> ThriftStructInstance {
-        let mut instance = ThriftStructInstance::empty(
-            self.name.clone(),
-            Arc::clone(&self.field_names_arc),
-            Arc::clone(&self.schema_arc),
-            Arc::clone(&self.struct_map),
-        );
+        let mut instance = self.new_instance_with_defaults();
         for (k, v) in items.iter() {
             if let Ok(name) = k.extract::<String>() {
                 if instance.is_valid_field(&name) {
@@ -112,12 +105,7 @@ impl ThriftStruct {
         if let Some(kw) = kwargs {
             self.new_instance_from_dict(py, kw)
         } else {
-            ThriftStructInstance::empty(
-                self.name.clone(),
-                Arc::clone(&self.field_names_arc),
-                Arc::clone(&self.schema_arc),
-                Arc::clone(&self.struct_map),
-            )
+            self.new_instance_with_defaults()
         }
     }
 
@@ -190,7 +178,7 @@ impl ThriftStruct {
     ) -> PyResult<Bound<'py, ThriftStructInstance>> {
         use super::serde::deserialize_struct_fields_as_instance;
         use crate::protocol::{
-            BinaryProtocolReader, CompactProtocolReader, JSONProtocolReader, TInputProtocol,
+            BinaryProtocolReader, CompactProtocolReader, TInputProtocol,
         };
         use std::io::Cursor;
         let mut cursor = Cursor::new(data);
@@ -219,15 +207,11 @@ impl ThriftStruct {
                 Ok(instance)
             }
             crate::python::parser::ProtocolType::JSON => {
-                let mut reader = JSONProtocolReader::new(&mut cursor);
-                reader.read_struct_begin().map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
-                })?;
-                let instance = deserialize_struct_fields_as_instance(&mut reader, self, py)?;
-                reader.read_struct_end().map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Read error: {}", e))
-                })?;
-                Ok(instance)
+                if let Some(instance) = self.deserialize_thriftpy2_json_envelope(py, data)? {
+                    return Ok(instance);
+                }
+                use super::serde::deserialize_json_direct;
+                deserialize_json_direct(self, data, py)
             }
         }
     }
@@ -247,6 +231,177 @@ impl ThriftStruct {
             self.name, self.fields
         )
     }
+}
+
+impl ThriftStruct {
+    fn new_instance_with_defaults(&self) -> ThriftStructInstance {
+        let mut instance = ThriftStructInstance::empty(
+            self.name.clone(),
+            Arc::clone(&self.field_names_arc),
+            Arc::clone(&self.schema_arc),
+            Arc::clone(&self.struct_map),
+        );
+        for field in &self.fields {
+            if let Some(default_value) = &field.default_value {
+                instance
+                    .values
+                    .insert(field.name.clone(), default_value.clone());
+            }
+        }
+        instance
+    }
+
+    fn deserialize_thriftpy2_json_envelope<'py>(
+        &self,
+        py: Python<'py>,
+        data: &[u8],
+    ) -> PyResult<Option<Bound<'py, ThriftStructInstance>>> {
+        let json_bytes = if data.len() >= 4 {
+            let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            if len == data.len().saturating_sub(4) {
+                &data[4..]
+            } else {
+                data
+            }
+        } else {
+            data
+        };
+
+        let Ok(root) = serde_json::from_slice::<Value>(json_bytes) else {
+            return Ok(None);
+        };
+        let Some(payload) = root.get("payload").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+
+        let mut values = HashMap::new();
+        for field in &self.fields {
+            if let Some(value) = payload.get(&field.name) {
+                values.insert(
+                    field.name.clone(),
+                    json_payload_to_thrift_value(&field.field_type, value, &self.struct_map)?,
+                );
+            } else if let Some(default_value) = &field.default_value {
+                values.insert(field.name.clone(), default_value.clone());
+            }
+        }
+
+        let instance = ThriftStructInstance::from_rust(
+            self.name.clone(),
+            Arc::clone(&self.field_names_arc),
+            values,
+            Arc::clone(&self.schema_arc),
+            Arc::clone(&self.struct_map),
+        );
+        Ok(Some(Bound::new(py, instance)?))
+    }
+}
+
+fn json_payload_to_thrift_value(
+    thrift_type: &ThriftType,
+    value: &Value,
+    struct_map: &Arc<HashMap<String, ThriftStruct>>,
+) -> PyResult<ThriftValue> {
+    match thrift_type {
+        ThriftType::Bool => Ok(ThriftValue::Bool(
+            value
+                .as_bool()
+                .unwrap_or_else(|| value.as_i64().unwrap_or(0) != 0),
+        )),
+        ThriftType::Byte => Ok(ThriftValue::Byte(json_i64(value)? as i8)),
+        ThriftType::I16 => Ok(ThriftValue::I16(json_i64(value)? as i16)),
+        ThriftType::I32 => Ok(ThriftValue::I32(json_i64(value)? as i32)),
+        ThriftType::I64 => Ok(ThriftValue::I64(json_i64(value)?)),
+        ThriftType::Double => Ok(ThriftValue::Double(value.as_f64().unwrap_or(0.0))),
+        ThriftType::String => Ok(ThriftValue::String(
+            value.as_str().unwrap_or_default().to_string(),
+        )),
+        ThriftType::Binary => {
+            let raw = value.as_str().unwrap_or_default();
+            let bytes = BASE64
+                .decode(raw)
+                .unwrap_or_else(|_| raw.as_bytes().to_vec());
+            Ok(ThriftValue::Binary(bytes))
+        }
+        ThriftType::List(element_type) => {
+            let items = value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| json_payload_to_thrift_value(element_type, item, struct_map))
+                        .collect::<PyResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(ThriftValue::List(items))
+        }
+        ThriftType::Set(element_type) => {
+            let items = value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| json_payload_to_thrift_value(element_type, item, struct_map))
+                        .collect::<PyResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(ThriftValue::Set(items))
+        }
+        ThriftType::Map(key_type, value_type) => {
+            let mut pairs = Vec::new();
+            if let Some(obj) = value.as_object() {
+                for (key, item) in obj {
+                    pairs.push((
+                        json_map_key_to_thrift_value(key_type, key)?,
+                        json_payload_to_thrift_value(value_type, item, struct_map)?,
+                    ));
+                }
+            }
+            Ok(ThriftValue::Map(pairs))
+        }
+        ThriftType::Struct(name) => {
+            let mut fields = HashMap::new();
+            if let Some(struct_def) = struct_map.get(name) {
+                if let Some(obj) = value.as_object() {
+                    for field in &struct_def.fields {
+                        if let Some(item) = obj.get(&field.name) {
+                            fields.insert(
+                                field.name.clone(),
+                                json_payload_to_thrift_value(&field.field_type, item, struct_map)?,
+                            );
+                        } else if let Some(default_value) = &field.default_value {
+                            fields.insert(field.name.clone(), default_value.clone());
+                        }
+                    }
+                }
+            }
+            Ok(ThriftValue::Struct {
+                name: Some(name.clone()),
+                fields,
+            })
+        }
+    }
+}
+
+fn json_map_key_to_thrift_value(thrift_type: &ThriftType, key: &str) -> PyResult<ThriftValue> {
+    match thrift_type {
+        ThriftType::Bool => Ok(ThriftValue::Bool(key == "true" || key == "1")),
+        ThriftType::Byte => Ok(ThriftValue::Byte(key.parse::<i8>().unwrap_or_default())),
+        ThriftType::I16 => Ok(ThriftValue::I16(key.parse::<i16>().unwrap_or_default())),
+        ThriftType::I32 => Ok(ThriftValue::I32(key.parse::<i32>().unwrap_or_default())),
+        ThriftType::I64 => Ok(ThriftValue::I64(key.parse::<i64>().unwrap_or_default())),
+        ThriftType::Double => Ok(ThriftValue::Double(key.parse::<f64>().unwrap_or_default())),
+        _ => Ok(ThriftValue::String(key.to_string())),
+    }
+}
+
+fn json_i64(value: &Value) -> PyResult<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("expected JSON integer"))
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -312,6 +467,23 @@ impl ThriftStructInstance {
             field_names,
             values,
             cache: HashMap::new(),
+            schema,
+            struct_map,
+        }
+    }
+
+    pub fn from_python_cache(
+        struct_name: String,
+        field_names: Arc<Vec<String>>,
+        cache: HashMap<String, Py<PyAny>>,
+        schema: Arc<HashMap<String, ThriftField>>,
+        struct_map: Arc<HashMap<String, ThriftStruct>>,
+    ) -> Self {
+        Self {
+            struct_name,
+            field_names,
+            values: HashMap::new(),
+            cache,
             schema,
             struct_map,
         }

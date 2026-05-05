@@ -77,6 +77,27 @@ impl ThriftParser {
         }
     }
 
+    pub fn list_enums(&self) -> PyResult<Vec<String>> {
+        match &self.document {
+            Some(doc) => Ok(doc.enums.keys().cloned().collect()),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
+        }
+    }
+
+    pub fn get_enum(&self, name: &str) -> PyResult<Option<HashMap<String, i32>>> {
+        match &self.document {
+            Some(doc) => Ok(doc
+                .enums
+                .get(name)
+                .map(|enum_def| enum_def.variants.clone())),
+            None => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "No document parsed yet",
+            )),
+        }
+    }
+
     pub fn get_service(&self, name: &str) -> PyResult<Option<PyThriftService>> {
         match &self.document {
             Some(doc) => Ok(doc.services.get(name).map(|svc| {
@@ -92,6 +113,7 @@ impl ThriftParser {
                                 name: f.name.clone(),
                                 required: f.required,
                                 field_type: f.field_type.clone(),
+                                default_value: f.default_value.clone(),
                             })
                             .collect();
                         let exceptions: Vec<ThriftField> = m
@@ -102,6 +124,7 @@ impl ThriftParser {
                                 name: f.name.clone(),
                                 required: f.required,
                                 field_type: f.field_type.clone(),
+                                default_value: f.default_value.clone(),
                             })
                             .collect();
                         let arg_field_map: HashMap<i16, usize> =
@@ -131,7 +154,7 @@ impl ThriftParser {
 impl ThriftParser {
     /// Return a snapshot of the whole parsed document's struct map.
     pub(crate) fn struct_map(&self) -> Arc<HashMap<String, ThriftStruct>> {
-        let map: HashMap<String, ThriftStruct> = match &self.document {
+        let mut map: HashMap<String, ThriftStruct> = match &self.document {
             Some(doc) => doc
                 .structs
                 .iter()
@@ -144,6 +167,7 @@ impl ThriftParser {
                             name: f.name.clone(),
                             required: f.required,
                             field_type: f.field_type.clone(),
+                            default_value: f.default_value.clone(),
                         })
                         .collect();
                     let field_map: HashMap<i16, usize> = fields
@@ -170,6 +194,27 @@ impl ThriftParser {
                 .collect(),
             None => HashMap::new(),
         };
+
+        if let Some(doc) = &self.document {
+            let include_stems: Vec<String> = doc
+                .includes
+                .iter()
+                .filter_map(|include| include.rsplit('/').next())
+                .filter_map(|file_name| file_name.strip_suffix(".thrift").or(Some(file_name)))
+                .map(ToString::to_string)
+                .collect();
+            let base_structs: Vec<(String, ThriftStruct)> = map
+                .iter()
+                .filter(|(name, _)| !name.contains('.'))
+                .map(|(name, struct_def)| (name.clone(), struct_def.clone()))
+                .collect();
+            for include_stem in include_stems {
+                for (name, struct_def) in &base_structs {
+                    map.entry(format!("{}.{}", include_stem, name))
+                        .or_insert_with(|| struct_def.clone());
+                }
+            }
+        }
         let arc = Arc::new(map);
         let patched: HashMap<String, ThriftStruct> = arc
             .iter()

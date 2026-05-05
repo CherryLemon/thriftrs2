@@ -20,6 +20,9 @@ pub struct Parser {
     tokens: Vec<Token>,
     position: usize,
     type_aliases: HashMap<String, ThriftType>,
+    enum_values: HashMap<String, HashMap<String, i32>>,
+    parsed_structs: HashMap<String, ThriftStruct>,
+    parsed_services: HashMap<String, ThriftService>,
 }
 
 impl Parser {
@@ -40,6 +43,9 @@ impl Parser {
             tokens,
             position: 0,
             type_aliases: HashMap::new(),
+            enum_values: HashMap::new(),
+            parsed_structs: HashMap::new(),
+            parsed_services: HashMap::new(),
         })
     }
 
@@ -70,6 +76,7 @@ impl Parser {
         let mut document = ThriftDocument {
             structs: HashMap::new(),
             services: HashMap::new(),
+            enums: HashMap::new(),
             includes: Vec::new(),
             namespaces: HashMap::new(),
         };
@@ -78,14 +85,26 @@ impl Parser {
             match self.current_token()? {
                 Token::Keyword(keyword) if keyword == "struct" => {
                     let struct_def = self.parse_struct("struct")?;
+                    self.parsed_structs
+                        .insert(struct_def.name.clone(), struct_def.clone());
                     document.structs.insert(struct_def.name.clone(), struct_def);
                 }
                 Token::Keyword(keyword) if keyword == "exception" => {
                     let struct_def = self.parse_struct("exception")?;
+                    self.parsed_structs
+                        .insert(struct_def.name.clone(), struct_def.clone());
+                    document.structs.insert(struct_def.name.clone(), struct_def);
+                }
+                Token::Keyword(keyword) if keyword == "union" => {
+                    let struct_def = self.parse_struct("union")?;
+                    self.parsed_structs
+                        .insert(struct_def.name.clone(), struct_def.clone());
                     document.structs.insert(struct_def.name.clone(), struct_def);
                 }
                 Token::Keyword(keyword) if keyword == "service" => {
                     let service_def = self.parse_service()?;
+                    self.parsed_services
+                        .insert(service_def.name.clone(), service_def.clone());
                     document
                         .services
                         .insert(service_def.name.clone(), service_def);
@@ -103,8 +122,12 @@ impl Parser {
                     self.type_aliases.insert(alias, aliased_type);
                 }
                 Token::Keyword(keyword) if keyword == "enum" => {
-                    let enum_name = self.parse_enum()?;
-                    self.type_aliases.insert(enum_name, ThriftType::I32);
+                    let enum_def = self.parse_enum()?;
+                    self.type_aliases
+                        .insert(enum_def.name.clone(), ThriftType::I32);
+                    self.enum_values
+                        .insert(enum_def.name.clone(), enum_def.variants.clone());
+                    document.enums.insert(enum_def.name.clone(), enum_def);
                 }
                 Token::Keyword(keyword) if keyword == "const" => {
                     self.parse_const()?;
@@ -126,6 +149,9 @@ impl Parser {
             token => return Err(ParseError::UnexpectedToken(token)),
         };
 
+        let extends = self.consume_optional_extends()?;
+        self.skip_annotations()?;
+
         self.expect_token(Token::LeftBrace)?;
 
         let mut fields = Vec::new();
@@ -137,7 +163,9 @@ impl Parser {
         }
 
         self.expect_token(Token::RightBrace)?;
+        self.skip_annotations()?;
 
+        let fields = self.merge_parent_fields(extends.as_deref(), fields)?;
         Ok(ThriftStruct { name, fields })
     }
 
@@ -162,17 +190,26 @@ impl Parser {
         };
 
         let field_type = self.parse_type()?;
+        self.skip_annotations()?;
 
         let name = match self.consume_token()? {
             Token::Identifier(name) => name,
             token => return Err(ParseError::UnexpectedToken(token)),
         };
 
-        // Skip optional default value and semicolon
+        let mut default_value = None;
         if let Ok(Token::Equal) = self.current_token() {
             self.consume_token()?; // consume '='
-            self.skip_default_value()?;
+            default_value = match self.parse_default_value(&field_type) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    self.skip_default_value()?;
+                    None
+                }
+            };
         }
+
+        self.skip_annotations()?;
 
         if let Ok(Token::Semicolon) = self.current_token() {
             self.consume_token()?;
@@ -183,7 +220,7 @@ impl Parser {
             name,
             field_type,
             required,
-            default_value: None,
+            default_value,
         })
     }
 
@@ -219,8 +256,13 @@ impl Parser {
                     Ok(ThriftType::Map(Box::new(key_type), Box::new(value_type)))
                 }
                 _ => {
-                    let type_name = self.finish_identifier_path(type_name)?;
-                    if let Some(alias) = self.type_aliases.get(&type_name) {
+                    let type_name = self.finish_qualified_identifier(type_name)?;
+                    let local_type_name = type_name.rsplit('.').next().unwrap_or(&type_name);
+                    if let Some(alias) = self
+                        .type_aliases
+                        .get(&type_name)
+                        .or_else(|| self.type_aliases.get(local_type_name))
+                    {
                         Ok(alias.clone())
                     } else {
                         Ok(ThriftType::Struct(type_name))
@@ -239,6 +281,9 @@ impl Parser {
             token => return Err(ParseError::UnexpectedToken(token)),
         };
 
+        let extends = self.consume_optional_extends()?;
+        self.skip_annotations()?;
+
         self.expect_token(Token::LeftBrace)?;
 
         let mut methods = Vec::new();
@@ -250,7 +295,9 @@ impl Parser {
         }
 
         self.expect_token(Token::RightBrace)?;
+        self.skip_annotations()?;
 
+        let methods = self.merge_parent_methods(extends.as_deref(), methods)?;
         Ok(ThriftService { name, methods })
     }
 
@@ -304,6 +351,8 @@ impl Parser {
         } else {
             Vec::new()
         };
+
+        self.skip_annotations()?;
 
         if matches!(self.current_token(), Ok(Token::Semicolon | Token::Comma)) {
             self.consume_token()?;
@@ -362,32 +411,255 @@ impl Parser {
         Ok((alias, aliased_type))
     }
 
-    fn parse_enum(&mut self) -> Result<String, ParseError> {
+    fn parse_enum(&mut self) -> Result<ThriftEnum, ParseError> {
         self.expect_token(Token::Keyword("enum".to_string()))?;
         let name = match self.consume_token()? {
             Token::Identifier(name) => name,
             token => return Err(ParseError::UnexpectedToken(token)),
         };
         self.expect_token(Token::LeftBrace)?;
-        self.skip_balanced_block(Token::LeftBrace, Token::RightBrace)?;
-        Ok(name)
+        let mut variants = HashMap::new();
+        let mut next_value = 0i32;
+        while let Ok(token) = self.current_token() {
+            if let Token::RightBrace = token {
+                break;
+            }
+            let variant_name = match self.consume_token()? {
+                Token::Identifier(variant_name) => variant_name,
+                Token::Comma | Token::Semicolon => continue,
+                token => return Err(ParseError::UnexpectedToken(token)),
+            };
+            let value = if let Ok(Token::Equal) = self.current_token() {
+                self.consume_token()?;
+                match self.consume_token()? {
+                    Token::Number(value) => value as i32,
+                    token => return Err(ParseError::UnexpectedToken(token)),
+                }
+            } else {
+                next_value
+            };
+            variants.insert(variant_name, value);
+            next_value = value + 1;
+            if matches!(self.current_token(), Ok(Token::Comma | Token::Semicolon)) {
+                self.consume_token()?;
+            }
+        }
+        self.expect_token(Token::RightBrace)?;
+        self.skip_annotations()?;
+        if let Ok(Token::Semicolon) = self.current_token() {
+            self.consume_token()?;
+        }
+        Ok(ThriftEnum { name, variants })
     }
 
     fn parse_const(&mut self) -> Result<(), ParseError> {
         self.expect_token(Token::Keyword("const".to_string()))?;
-        let _ = self.parse_type()?;
+        let const_type = self.parse_type()?;
         match self.consume_token()? {
             Token::Identifier(_) => {}
             token => return Err(ParseError::UnexpectedToken(token)),
         }
         if let Ok(Token::Equal) = self.current_token() {
             self.consume_token()?;
-            self.skip_default_value()?;
+            if self.parse_default_value(&const_type).is_err() {
+                self.skip_default_value()?;
+            }
         }
         if let Ok(Token::Semicolon) = self.current_token() {
             self.consume_token()?;
         }
         Ok(())
+    }
+
+    fn consume_optional_extends(&mut self) -> Result<Option<String>, ParseError> {
+        if matches!(self.current_token(), Ok(Token::Keyword(keyword)) if keyword == "extends") {
+            self.consume_token()?;
+            let name = match self.consume_token()? {
+                Token::Identifier(name) | Token::Keyword(name) => {
+                    self.finish_identifier_path(name)?
+                }
+                token => return Err(ParseError::UnexpectedToken(token)),
+            };
+            Ok(Some(name))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn merge_parent_fields(
+        &self,
+        parent_name: Option<&str>,
+        fields: Vec<ThriftField>,
+    ) -> Result<Vec<ThriftField>, ParseError> {
+        let Some(parent_name) = parent_name else {
+            return Ok(fields);
+        };
+        let Some(parent) = self.parsed_structs.get(parent_name) else {
+            return Err(ParseError::SyntaxError(format!(
+                "Unknown parent struct: {}",
+                parent_name
+            )));
+        };
+
+        let mut merged = parent.fields.clone();
+        for field in fields {
+            if merged
+                .iter()
+                .any(|existing| existing.id == field.id || existing.name == field.name)
+            {
+                return Err(ParseError::SyntaxError(format!(
+                    "Duplicate inherited field '{}' in extends {}",
+                    field.name, parent_name
+                )));
+            }
+            merged.push(field);
+        }
+        Ok(merged)
+    }
+
+    fn merge_parent_methods(
+        &self,
+        parent_name: Option<&str>,
+        methods: Vec<ThriftMethod>,
+    ) -> Result<Vec<ThriftMethod>, ParseError> {
+        let Some(parent_name) = parent_name else {
+            return Ok(methods);
+        };
+        let Some(parent) = self.parsed_services.get(parent_name) else {
+            return Err(ParseError::SyntaxError(format!(
+                "Unknown parent service: {}",
+                parent_name
+            )));
+        };
+
+        let mut merged = parent.methods.clone();
+        for method in methods {
+            if merged.iter().any(|existing| existing.name == method.name) {
+                return Err(ParseError::SyntaxError(format!(
+                    "Duplicate inherited method '{}' in extends {}",
+                    method.name, parent_name
+                )));
+            }
+            merged.push(method);
+        }
+        Ok(merged)
+    }
+
+    fn skip_annotations(&mut self) -> Result<(), ParseError> {
+        while matches!(self.current_token(), Ok(Token::LeftParen)) {
+            self.consume_token()?;
+            self.skip_balanced_block(Token::LeftParen, Token::RightParen)?;
+        }
+        Ok(())
+    }
+
+    fn parse_default_value(&mut self, thrift_type: &ThriftType) -> Result<ThriftValue, ParseError> {
+        match thrift_type {
+            ThriftType::Bool => self.parse_bool_default(),
+            ThriftType::Byte => Ok(ThriftValue::Byte(self.parse_i64_default()? as i8)),
+            ThriftType::I16 => Ok(ThriftValue::I16(self.parse_i64_default()? as i16)),
+            ThriftType::I32 => Ok(ThriftValue::I32(self.parse_i64_default()? as i32)),
+            ThriftType::I64 => Ok(ThriftValue::I64(self.parse_i64_default()?)),
+            ThriftType::Double => Ok(ThriftValue::Double(self.parse_i64_default()? as f64)),
+            ThriftType::String => match self.consume_token()? {
+                Token::String(value) | Token::Identifier(value) | Token::Keyword(value) => {
+                    Ok(ThriftValue::String(value))
+                }
+                token => Err(ParseError::UnexpectedToken(token)),
+            },
+            ThriftType::Binary => match self.consume_token()? {
+                Token::String(value) => Ok(ThriftValue::Binary(value.into_bytes())),
+                token => Err(ParseError::UnexpectedToken(token)),
+            },
+            ThriftType::List(element_type) => {
+                let values = self.parse_default_sequence(element_type)?;
+                Ok(ThriftValue::List(values))
+            }
+            ThriftType::Set(element_type) => {
+                let values = self.parse_default_sequence(element_type)?;
+                Ok(ThriftValue::Set(values))
+            }
+            ThriftType::Map(key_type, value_type) => {
+                self.expect_token(Token::LeftBrace)?;
+                let mut pairs = Vec::new();
+                while let Ok(token) = self.current_token() {
+                    if let Token::RightBrace = token {
+                        break;
+                    }
+                    let key = self.parse_default_value(key_type)?;
+                    self.expect_token(Token::Colon)?;
+                    let value = self.parse_default_value(value_type)?;
+                    pairs.push((key, value));
+                    if matches!(self.current_token(), Ok(Token::Comma | Token::Semicolon)) {
+                        self.consume_token()?;
+                    }
+                }
+                self.expect_token(Token::RightBrace)?;
+                Ok(ThriftValue::Map(pairs))
+            }
+            ThriftType::Struct(name) => {
+                self.skip_default_value()?;
+                Ok(ThriftValue::Struct {
+                    name: Some(name.clone()),
+                    fields: HashMap::new(),
+                })
+            }
+        }
+    }
+
+    fn parse_default_sequence(
+        &mut self,
+        element_type: &ThriftType,
+    ) -> Result<Vec<ThriftValue>, ParseError> {
+        self.expect_token(Token::LeftBracket)?;
+        let mut values = Vec::new();
+        while let Ok(token) = self.current_token() {
+            if let Token::RightBracket = token {
+                break;
+            }
+            values.push(self.parse_default_value(element_type)?);
+            if matches!(self.current_token(), Ok(Token::Comma | Token::Semicolon)) {
+                self.consume_token()?;
+            }
+        }
+        self.expect_token(Token::RightBracket)?;
+        Ok(values)
+    }
+
+    fn parse_bool_default(&mut self) -> Result<ThriftValue, ParseError> {
+        match self.consume_token()? {
+            Token::Identifier(value) | Token::Keyword(value) if value == "true" => {
+                Ok(ThriftValue::Bool(true))
+            }
+            Token::Identifier(value) | Token::Keyword(value) if value == "false" => {
+                Ok(ThriftValue::Bool(false))
+            }
+            Token::Number(value) => Ok(ThriftValue::Bool(value != 0)),
+            token => Err(ParseError::UnexpectedToken(token)),
+        }
+    }
+
+    fn parse_i64_default(&mut self) -> Result<i64, ParseError> {
+        match self.consume_token()? {
+            Token::Number(value) => Ok(value),
+            Token::Identifier(first) | Token::Keyword(first) => {
+                let parts = self.finish_identifier_path_parts(first)?;
+                if parts.len() == 2 {
+                    if let Some(value) = self
+                        .enum_values
+                        .get(&parts[0])
+                        .and_then(|variants| variants.get(&parts[1]))
+                    {
+                        return Ok(*value as i64);
+                    }
+                }
+                Err(ParseError::SyntaxError(format!(
+                    "Unknown numeric default value: {}",
+                    parts.join(".")
+                )))
+            }
+            token => Err(ParseError::UnexpectedToken(token)),
+        }
     }
 
     fn finish_identifier_path(&mut self, first: String) -> Result<String, ParseError> {
@@ -498,7 +770,9 @@ mod tests {
         let doc = parse("struct User { 1: required string name = \"Ada\"; }");
         let field = &doc.structs.get("User").unwrap().fields[0];
         assert_eq!(field.name, "name");
-        assert!(field.default_value.is_none());
+        assert!(
+            matches!(field.default_value, Some(ThriftValue::String(ref value)) if value == "Ada")
+        );
     }
 
     #[test]
@@ -555,9 +829,57 @@ mod tests {
 
         assert_eq!(doc.includes, vec!["common.thrift".to_string()]);
         assert_eq!(doc.namespaces.get("py").unwrap(), "thrift.example");
+        assert_eq!(
+            doc.enums.get("Status").unwrap().variants.get("OK"),
+            Some(&1)
+        );
         let fields = &doc.structs.get("Event").unwrap().fields;
         assert!(matches!(fields[0].field_type, ThriftType::I64));
         assert!(matches!(fields[1].field_type, ThriftType::I32));
+        assert!(matches!(fields[1].default_value, Some(ThriftValue::I32(1))));
+    }
+
+    #[test]
+    fn parses_union_extends_annotations_and_defaults() {
+        let doc = parse(
+            r#"
+            struct Base { 1: string id; }
+            union Choice extends Base (scope="test") {
+                2: string name = "fallback" (ui.hidden="true");
+                3: list<i32> ids = [1, 2, 3];
+                4: map<string, i32> counts = {"a": 1, "b": 2};
+            }
+            service Parent { void base_ping(); }
+            service Child extends Parent (owner="bench") { void ping(); }
+            "#,
+        );
+        let fields: HashMap<_, _> = doc
+            .structs
+            .get("Choice")
+            .unwrap()
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field))
+            .collect();
+        assert!(fields.contains_key("id"));
+        assert!(
+            matches!(fields["name"].default_value, Some(ThriftValue::String(ref value)) if value == "fallback")
+        );
+        assert!(
+            matches!(fields["ids"].default_value, Some(ThriftValue::List(ref values)) if values.len() == 3)
+        );
+        assert!(
+            matches!(fields["counts"].default_value, Some(ThriftValue::Map(ref pairs)) if pairs.len() == 2)
+        );
+        let methods: Vec<_> = doc
+            .services
+            .get("Child")
+            .unwrap()
+            .methods
+            .iter()
+            .map(|method| method.name.as_str())
+            .collect();
+        assert_eq!(methods, vec!["base_ping", "ping"]);
     }
 
     #[test]
@@ -574,11 +896,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_qualified_type_to_local_symbol() {
+    fn preserves_qualified_type_name() {
         let doc =
             parse("struct Shared { 1: string name; } struct Holder { 1: common.Shared value; }");
         let field = &doc.structs.get("Holder").unwrap().fields[0];
-        assert!(matches!(&field.field_type, ThriftType::Struct(name) if name == "Shared"));
+        assert!(matches!(&field.field_type, ThriftType::Struct(name) if name == "common.Shared"));
     }
 
     #[test]
