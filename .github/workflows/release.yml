@@ -30,34 +30,100 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: --release --out dist -i python3.9 -i python3.10 -i python3.11 -i python3.12 -i python3.13
-          manylinux: auto
+          args: >-
+            --release --out dist
+            -i python3.9 -i python3.10 -i python3.11
+            -i python3.12 -i python3.13 -i python3.14
+          manylinux: "2_28"
           sdist: ${{ matrix.target == 'x86_64' }}
-          artifact-name: wheels-linux-${{ matrix.target }}
+          artifact-name: wheels-linux-${{ matrix.target }}-2_28
 
-  windows:
-    runs-on: windows-latest
+  linux-manylinux2014:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
     steps:
       - uses: actions/checkout@v6
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist
+          target: ${{ matrix.target }}
+          args: >-
+            --release --out dist
+            -i python3.9 -i python3.10 -i python3.11
+            -i python3.12 -i python3.13
+          manylinux: auto
+          sdist: false
+          artifact-name: wheels-linux-${{ matrix.target }}-2014
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: >-
+            --release --out dist
+            -i python3.9 -i python3.10 -i python3.11
+            -i python3.12 -i python3.13 -i python3.14
           artifact-name: wheels-windows-x64
 
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
       - uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --target universal2-apple-darwin
+          args: >-
+            --release --out dist
+            -i python3.9 -i python3.10 -i python3.11
+            -i python3.12 -i python3.13 -i python3.14
+            --target universal2-apple-darwin
           artifact-name: wheels-macos-universal2
 
   collect:
     name: Check distributions
-    needs: [linux, windows, macos]
+    needs: [linux, linux-manylinux2014, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v6
