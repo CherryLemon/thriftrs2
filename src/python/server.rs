@@ -187,23 +187,27 @@ enum CallOutcome {
     Async(Py<PyAny>),
 }
 
+struct HandlerCtx<'a> {
+    struct_map: &'a Arc<HashMap<String, ThriftStruct>>,
+    handlers: &'a HashMap<String, RegisteredHandler>,
+    protocol: ProtocolType,
+}
+
 fn invoke_python_handler(
     py: Python<'_>,
     method: &PyThriftMethod,
-    struct_map: &Arc<HashMap<String, ThriftStruct>>,
-    handlers: &HashMap<String, RegisteredHandler>,
+    ctx: &HandlerCtx<'_>,
     method_name: &str,
     args_values: &HashMap<String, ThriftValue>,
-    protocol: ProtocolType,
     seq_id: i32,
 ) -> PyResult<CallOutcome> {
-    let handler_entry = handlers.get(method_name).expect("handler checked above");
+    let handler_entry = ctx.handlers.get(method_name).expect("handler checked above");
     let handler = handler_entry.callable.clone_ref(py);
 
     let kwargs = PyDict::new(py);
     for field in &method.arguments {
         if let Some(value) = args_values.get(&field.name) {
-            let py_value = thrift_value_to_py(value, py, struct_map)?;
+            let py_value = thrift_value_to_py(value, py, ctx.struct_map)?;
             kwargs.set_item(&field.name, py_value.bind(py))?;
         } else {
             kwargs.set_item(&field.name, py.None())?;
@@ -217,8 +221,8 @@ fn invoke_python_handler(
                 py,
                 &err,
                 method,
-                struct_map,
-                protocol,
+                ctx.struct_map,
+                ctx.protocol,
                 method_name,
                 seq_id,
             )? {
@@ -234,8 +238,8 @@ fn invoke_python_handler(
             py,
             &method.return_type,
             call_result.bind(py),
-            struct_map,
-            protocol,
+            ctx.struct_map,
+            ctx.protocol,
             method_name,
             seq_id,
         )?;
@@ -376,9 +380,16 @@ impl ThriftServer {
         );
 
         std::thread::spawn(move || {
-            rt.block_on(accept_loop(
-                addr, service, handlers, struct_map, transport, protocol, running, shutdown,
-            ));
+            rt.block_on(accept_loop(AcceptCtx {
+                addr,
+                service,
+                handlers,
+                struct_map,
+                transport,
+                protocol,
+                running,
+                shutdown,
+            }));
         });
 
         Ok(())
@@ -419,7 +430,7 @@ fn build_runtime(n_workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
 // Async accept loop
 // ──────────────────────────────────────────────────────────────────────────────
 
-async fn accept_loop(
+struct AcceptCtx {
     addr: String,
     service: Arc<PyThriftService>,
     handlers: Arc<HashMap<String, RegisteredHandler>>,
@@ -428,19 +439,21 @@ async fn accept_loop(
     protocol: ProtocolType,
     running: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
-) {
-    let listener = match TcpListener::bind(&addr).await {
+}
+
+async fn accept_loop(ctx: AcceptCtx) {
+    let listener = match TcpListener::bind(&ctx.addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("bind error on {}: {}", addr, e);
+            eprintln!("bind error on {}: {}", ctx.addr, e);
             return;
         }
     };
-    running.store(true, Ordering::SeqCst);
+    ctx.running.store(true, Ordering::SeqCst);
     loop {
         // Listen for either a shutdown signal (programmatic) or Ctrl+C, or an incoming connection.
         tokio::select! {
-            _ = shutdown.notified() => {
+            _ = ctx.shutdown.notified() => {
                 println!("shutdown requested");
                 break;
             }
@@ -457,13 +470,13 @@ async fn accept_loop(
                     }
                 };
 
-                let service = Arc::clone(&service);
-                let handlers = Arc::clone(&handlers);
-                let struct_map = Arc::clone(&struct_map);
+                let service = Arc::clone(&ctx.service);
+                let handlers = Arc::clone(&ctx.handlers);
+                let struct_map = Arc::clone(&ctx.struct_map);
 
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_connection(stream, service, handlers, struct_map, transport, protocol).await
+                        handle_connection(stream, service, handlers, struct_map, ctx.transport, ctx.protocol).await
                     {
                         use std::io::ErrorKind::*;
                         if e.kind() != UnexpectedEof
@@ -482,7 +495,7 @@ async fn accept_loop(
     // (In normal operation the loop is infinite; this ensures correctness
     // if the loop ever ends.)
     // Note: unreachable in the current design, but kept for completeness.
-    running.store(false, Ordering::SeqCst);
+    ctx.running.store(false, Ordering::SeqCst);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -567,15 +580,18 @@ async fn handle_connection(
                         let method_name = method_name.clone();
                         let args_values = args_values.clone();
                         move || {
+                            let ctx = HandlerCtx {
+                                struct_map: &struct_map2,
+                                handlers: &handlers2,
+                                protocol,
+                            };
                             Python::attach(|py| {
                                 invoke_python_handler(
                                     py,
                                     &method,
-                                    &struct_map2,
-                                    &handlers2,
+                                    &ctx,
                                     &method_name,
                                     &args_values,
-                                    protocol,
                                     seq_id,
                                 )
                             })
@@ -585,15 +601,18 @@ async fn handle_connection(
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
                 } else {
+                    let ctx = HandlerCtx {
+                        struct_map: &struct_map2,
+                        handlers: &handlers2,
+                        protocol,
+                    };
                     Python::attach(|py| {
                         invoke_python_handler(
                             py,
                             &method,
-                            &struct_map2,
-                            &handlers2,
+                            &ctx,
                             &method_name,
                             &args_values,
-                            protocol,
                             seq_id,
                         )
                     })

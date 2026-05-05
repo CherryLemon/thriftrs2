@@ -1050,7 +1050,7 @@ pub(crate) fn deserialize_json_direct<'py>(
         }
     }
 
-    Ok(Bound::new(
+    Bound::new(
         py,
         ThriftStructInstance::from_python_cache(
             struct_def.name.clone(),
@@ -1059,7 +1059,7 @@ pub(crate) fn deserialize_json_direct<'py>(
             Arc::clone(&struct_def.schema_arc),
             Arc::clone(&struct_def.struct_map),
         ),
-    )?)
+    )
 }
 
 /// Best-effort conversion of an arbitrary Python object to a `ThriftValue`
