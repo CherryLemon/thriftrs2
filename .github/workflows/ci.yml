@@ -51,7 +51,9 @@ jobs:
       - name: Install Python deps
         run: pip install "maturin>=1.8,<2.0" pytest thriftpy2
       - name: Build and install extension
-        run: maturin develop --release
+        run: |
+          maturin build --release --interpreter python --out dist
+          python -m pip install --force-reinstall dist/*.whl
       - name: Run fast pytest
         run: python -m pytest -q -m "not rpc"
       - name: Run RPC pytest
