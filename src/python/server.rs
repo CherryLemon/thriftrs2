@@ -623,23 +623,23 @@ async fn handle_http_connection(
     })
     .await
     .unwrap_or_else(|err| Err(err.to_string()))
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    .map_err(std::io::Error::other)?;
 
     match outcome {
         HttpCallbackOutcome::Sync => Ok(()),
         HttpCallbackOutcome::Async(coro) => {
             let locals = current_worker_python_locals()
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                .map_err(std::io::Error::other)?;
             let py_future: Result<_, String> = Python::attach(|py| {
                 pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
                     .map_err(|err: PyErr| err.to_string())
             });
             let py_future =
-                py_future.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+                py_future.map_err(std::io::Error::other)?;
             py_future
                 .await
                 .map(|_| ())
-                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+                .map_err(|err| std::io::Error::other(err.to_string()))
         }
     }
 }
