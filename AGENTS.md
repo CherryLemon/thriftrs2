@@ -10,7 +10,7 @@
 - `src/python/types.rs` is the core schema-aware Python boundary. `ThriftStruct` is callable from Python (for example `mod.User(id=1, ...)`) and produces `ThriftStructInstance`; serialization accepts either a plain `dict` or a `ThriftStructInstance`.
 - `src/python/serde.rs` is the shared conversion layer between Python objects and wire values. If a type change touches nested structs, containers, or attribute coercion, it usually belongs here.
 - `src/protocol/{binary,compact,json}.rs` holds protocol codecs; `src/protocol/types.rs` defines shared protocol traits/types.
-- `src/python/client.rs` and `src/python/server.rs` implement RPC over Tokio TCP. The client serializes calls in Rust, and the server dispatches Python handlers after decoding the request.
+- `src/python/client.rs` and `src/python/server.rs` implement RPC over Tokio TCP. The client serializes calls in Rust, and the server dispatches Python handlers after decoding the request. Optionally, `ThriftServer` can register an **HTTP probe handler**: peek at the start of each connection; if it looks like HTTP (e.g. `GET /health`, `GET /metrics` for Prometheus), hand the socket to Python so you can answer **same-port** HTTP probes (K8s/LB health, metrics scrapes, `curl` ops checks, scanners) while Thrift RPC stays on the same listen address; otherwise decode as Thrift. The callback is not a built-in HTTP stack—implement minimal responses or wrap the socket yourself.
 - The high-level Python façade lives in `python/thriftrs2/{__init__.py,loader.py,protocol.py}` and intentionally mimics `thriftpy2` usage (`load`, `make_client`, `make_server`, `serialize`, `deserialize`).
 
 ## Codebase-specific conventions

@@ -354,6 +354,22 @@ impl ThriftServer {
         Ok(())
     }
 
+    /// Register an optional callback for connections that begin like HTTP.
+    ///
+    /// After `accept`, the server peeks the first bytes of the stream. If they
+    /// match a common HTTP method prefix (`GET `, `POST `, …), the TCP socket
+    /// is turned into a Python `socket.socket` (via `fileno=`) and passed to
+    /// `handler(sock)`; Rust releases the connection and does not run the Thrift
+    /// decoder on it. Non-HTTP traffic is unchanged.
+    ///
+    /// **Why:** same-port coexistence when ops constraints expect HTTP on the
+    /// service port—e.g. Kubernetes or cloud LB health checks (`GET /health`),
+    /// Prometheus scrape (`GET /metrics`), human `curl` sanity checks, or legacy
+    /// monitors that only issue HTTP, without opening a second listen port or
+    /// changing service discovery.
+    /// This is not a full HTTP server; the callback owns parsing and response.
+    ///
+    /// `handler` may be sync or `async def` (same detection as RPC handlers).
     pub fn register_http_handler(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<()> {
         let is_async = py
             .import("inspect")?
@@ -366,6 +382,7 @@ impl ThriftServer {
         Ok(())
     }
 
+    /// Remove the HTTP probe callback so all connections use Thrift only.
     pub fn clear_http_handler(&mut self) {
         self.http_handler = None;
     }
