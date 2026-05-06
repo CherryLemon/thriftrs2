@@ -18,6 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex as AsyncMutex;
+
+use pyo3_async_runtimes::tokio::future_into_py;
 
 use super::parser::{ProtocolType, ThriftParser};
 use super::serde::{
@@ -215,56 +218,16 @@ impl ThriftClient {
         };
 
         // ── Phase 1: serialise the call frame in a single writer pass ─────────
-        let call_frame: Vec<u8> = {
-            let empty_dict;
-            let kw: &Bound<'_, PyDict> = if let Some(k) = kwargs {
-                k
-            } else {
-                empty_dict = PyDict::new(py);
-                &empty_dict
-            };
-
-            let mut buf = Vec::with_capacity(256);
-            match self.protocol {
-                ProtocolType::Binary => {
-                    let mut writer = BinaryProtocolWriter::new(&mut buf);
-                    write_call_frame(
-                        &mut writer,
-                        method_name,
-                        message_type,
-                        seq_id,
-                        &method.arguments,
-                        kw,
-                        &self.struct_map,
-                    )?;
-                }
-                ProtocolType::Compact => {
-                    let mut writer = CompactProtocolWriter::new(&mut buf);
-                    write_call_frame(
-                        &mut writer,
-                        method_name,
-                        message_type,
-                        seq_id,
-                        &method.arguments,
-                        kw,
-                        &self.struct_map,
-                    )?;
-                }
-                ProtocolType::JSON => {
-                    let mut writer = JSONProtocolWriter::new(&mut buf);
-                    write_call_frame(
-                        &mut writer,
-                        method_name,
-                        message_type,
-                        seq_id,
-                        &method.arguments,
-                        kw,
-                        &self.struct_map,
-                    )?;
-                }
-            }
-            buf
-        };
+        let call_frame = build_call_frame(
+            py,
+            method_name,
+            message_type,
+            seq_id,
+            &method.arguments,
+            kwargs,
+            &self.struct_map,
+            self.protocol,
+        )?;
 
         let return_type = method.return_type.clone();
         let exceptions = method.exceptions.clone();
@@ -306,22 +269,336 @@ impl ThriftClient {
             .map_err(PyErr::new::<pyo3::exceptions::PyOSError, _>)?;
 
         // ── Phase 3: decode reply directly into Python objects ────────────────
-        let mut cursor = Cursor::new(&reply_payload[..]);
-        match protocol {
-            ProtocolType::Binary => {
-                let mut reader = BinaryProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
-            }
-            ProtocolType::Compact => {
-                let mut reader = CompactProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
-            }
-            ProtocolType::JSON => {
-                let mut reader = JSONProtocolReader::new(&mut cursor);
-                decode_reply(&mut reader, &return_type, &exceptions, &struct_map, py)
-            }
+        decode_reply_bytes(
+            &reply_payload,
+            &return_type,
+            &exceptions,
+            &struct_map,
+            protocol,
+            py,
+        )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers shared by sync and async clients
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn build_call_frame(
+    py: Python<'_>,
+    method_name: &str,
+    message_type: u8,
+    seq_id: i32,
+    arguments: &[ThriftField],
+    kwargs: Option<&Bound<'_, PyDict>>,
+    struct_map: &HashMap<String, ThriftStruct>,
+    protocol: ProtocolType,
+) -> PyResult<Vec<u8>> {
+    let empty_dict;
+    let kw: &Bound<'_, PyDict> = if let Some(k) = kwargs {
+        k
+    } else {
+        empty_dict = PyDict::new(py);
+        &empty_dict
+    };
+
+    let mut buf = Vec::with_capacity(256);
+    match protocol {
+        ProtocolType::Binary => {
+            let mut writer = BinaryProtocolWriter::new(&mut buf);
+            write_call_frame(
+                &mut writer,
+                method_name,
+                message_type,
+                seq_id,
+                arguments,
+                kw,
+                struct_map,
+            )?;
+        }
+        ProtocolType::Compact => {
+            let mut writer = CompactProtocolWriter::new(&mut buf);
+            write_call_frame(
+                &mut writer,
+                method_name,
+                message_type,
+                seq_id,
+                arguments,
+                kw,
+                struct_map,
+            )?;
+        }
+        ProtocolType::JSON => {
+            let mut writer = JSONProtocolWriter::new(&mut buf);
+            write_call_frame(
+                &mut writer,
+                method_name,
+                message_type,
+                seq_id,
+                arguments,
+                kw,
+                struct_map,
+            )?;
         }
     }
+    Ok(buf)
+}
+
+fn decode_reply_bytes(
+    payload: &[u8],
+    return_type: &ThriftType,
+    exceptions: &[ThriftField],
+    struct_map: &HashMap<String, ThriftStruct>,
+    protocol: ProtocolType,
+    py: Python<'_>,
+) -> PyResult<Py<PyAny>> {
+    let mut cursor = Cursor::new(payload);
+    match protocol {
+        ProtocolType::Binary => {
+            let mut reader = BinaryProtocolReader::new(&mut cursor);
+            decode_reply(&mut reader, return_type, exceptions, struct_map, py)
+        }
+        ProtocolType::Compact => {
+            let mut reader = CompactProtocolReader::new(&mut cursor);
+            decode_reply(&mut reader, return_type, exceptions, struct_map, py)
+        }
+        ProtocolType::JSON => {
+            let mut reader = JSONProtocolReader::new(&mut cursor);
+            decode_reply(&mut reader, return_type, exceptions, struct_map, py)
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// AsyncThriftClient
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// An async Thrift client that exposes Python coroutines for `open`, `call`,
+/// and `close`. Backed by the shared pyo3-async-runtimes Tokio runtime.
+#[pyclass]
+pub struct AsyncThriftClient {
+    service: PyThriftService,
+    struct_map: Arc<HashMap<String, ThriftStruct>>,
+    transport: TransportType,
+    protocol: ProtocolType,
+    host: String,
+    port: u16,
+    conn: Arc<AsyncMutex<Option<Connection>>>,
+    seq_id: AtomicI32,
+    method_index: HashMap<String, usize>,
+}
+
+#[pymethods]
+impl AsyncThriftClient {
+    #[new]
+    #[pyo3(signature = (service, host, port, transport = TransportType::Framed, protocol = ProtocolType::Binary))]
+    pub fn new(
+        service: PyThriftService,
+        host: String,
+        port: u16,
+        transport: TransportType,
+        protocol: ProtocolType,
+    ) -> Self {
+        let method_index: HashMap<String, usize> = service
+            .methods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.name.clone(), i))
+            .collect();
+        Self {
+            service,
+            struct_map: Arc::new(HashMap::new()),
+            transport,
+            protocol,
+            host,
+            port,
+            conn: Arc::new(AsyncMutex::new(None)),
+            seq_id: AtomicI32::new(0),
+            method_index,
+        }
+    }
+
+    pub fn set_parser(&mut self, parser: &ThriftParser) {
+        self.struct_map = parser.struct_map();
+    }
+
+    #[getter]
+    pub fn transport(&self) -> TransportType {
+        self.transport
+    }
+
+    #[setter]
+    pub fn set_transport(&mut self, transport: TransportType) {
+        self.transport = transport;
+    }
+
+    #[getter]
+    pub fn protocol(&self) -> ProtocolType {
+        self.protocol
+    }
+
+    #[setter]
+    pub fn set_protocol(&mut self, protocol: ProtocolType) {
+        self.protocol = protocol;
+    }
+
+    /// Returns `True` if the client currently holds an open TCP connection.
+    /// A concurrent in-flight call is also reported as open.
+    pub fn is_open(&self) -> bool {
+        match self.conn.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
+    }
+
+    pub fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let host = self.host.clone();
+        let port = self.port;
+        let conn_arc = Arc::clone(&self.conn);
+        future_into_py(py, async move {
+            connect_and_store(&host, port, &conn_arc).await
+        })
+    }
+
+    pub fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let conn_arc = Arc::clone(&self.conn);
+        future_into_py(py, async move {
+            let mut guard = conn_arc.lock().await;
+            *guard = None;
+            Ok(())
+        })
+    }
+
+    fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let (host, port, conn_arc) = {
+            let s = slf.bind(py).borrow();
+            (s.host.clone(), s.port, Arc::clone(&s.conn))
+        };
+        future_into_py(py, async move {
+            connect_and_store(&host, port, &conn_arc).await?;
+            Ok(slf)
+        })
+    }
+
+    #[pyo3(signature = (_exc_type, _exc_value, _traceback))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Bound<'py, PyAny>,
+        _exc_value: Bound<'py, PyAny>,
+        _traceback: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let conn_arc = Arc::clone(&self.conn);
+        future_into_py(py, async move {
+            let mut guard = conn_arc.lock().await;
+            *guard = None;
+            Ok(())
+        })
+    }
+
+    #[pyo3(signature = (method_name, **kwargs))]
+    pub fn call<'py>(
+        &self,
+        py: Python<'py>,
+        method_name: &str,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let method_idx = self.method_index.get(method_name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Unknown method: {}",
+                method_name
+            ))
+        })?;
+        let method = &self.service.methods[*method_idx];
+
+        let seq_id = self.seq_id.fetch_add(1, Ordering::Relaxed);
+        let message_type = if method.oneway {
+            MESSAGE_TYPE_ONEWAY
+        } else {
+            MESSAGE_TYPE_CALL
+        };
+
+        // Serialize the call frame while we still hold the GIL.
+        let call_frame = build_call_frame(
+            py,
+            method_name,
+            message_type,
+            seq_id,
+            &method.arguments,
+            kwargs,
+            &self.struct_map,
+            self.protocol,
+        )?;
+
+        let return_type = method.return_type.clone();
+        let exceptions = method.exceptions.clone();
+        let struct_map = Arc::clone(&self.struct_map);
+        let transport = self.transport;
+        let protocol = self.protocol;
+        let is_oneway = method.oneway;
+        let conn_arc = Arc::clone(&self.conn);
+
+        future_into_py(py, async move {
+            let reply_payload: Option<Vec<u8>> = {
+                let mut guard = conn_arc.lock().await;
+                let conn = guard.as_mut().ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        "AsyncThriftClient is not open; await client.open() first",
+                    )
+                })?;
+                conn_send_frame(&mut conn.writer, &call_frame, transport)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("I/O error: {}", e))
+                    })?;
+                if is_oneway {
+                    None
+                } else {
+                    let payload = conn_recv_frame(&mut conn.reader, transport, protocol)
+                        .await
+                        .map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "I/O error: {}",
+                                e
+                            ))
+                        })?;
+                    Some(payload)
+                }
+            };
+
+            Python::attach(|py| match reply_payload {
+                None => Ok(py.None()),
+                Some(payload) => decode_reply_bytes(
+                    &payload,
+                    &return_type,
+                    &exceptions,
+                    &struct_map,
+                    protocol,
+                    py,
+                ),
+            })
+        })
+    }
+}
+
+async fn connect_and_store(
+    host: &str,
+    port: u16,
+    conn_arc: &AsyncMutex<Option<Connection>>,
+) -> PyResult<()> {
+    let addr = format!("{}:{}", host, port);
+    let stream = TcpStream::connect(&addr).await.map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("connect to {}: {}", addr, e))
+    })?;
+    let _ = stream.set_nodelay(true);
+    let (read_half, write_half) = stream.into_split();
+    let mut guard = conn_arc.lock().await;
+    *guard = Some(Connection {
+        reader: BufReader::with_capacity(65536, read_half),
+        writer: BufWriter::with_capacity(65536, write_half),
+    });
+    Ok(())
 }
 
 fn write_call_frame<P: TOutputProtocol>(

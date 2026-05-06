@@ -211,7 +211,7 @@ impl Parser {
 
         self.skip_annotations()?;
 
-        if let Ok(Token::Semicolon) = self.current_token() {
+        if matches!(self.current_token(), Ok(Token::Semicolon | Token::Comma)) {
             self.consume_token()?;
         }
 
@@ -763,6 +763,15 @@ mod tests {
         assert!(matches!(user.fields[0].field_type, ThriftType::I32));
         assert!(user.fields[0].required);
         assert!(!user.fields[1].required);
+    }
+
+    #[test]
+    fn parses_struct_fields_with_comma_separators() {
+        let doc = parse("struct User { 1: required i32 id, 2: optional string name, }");
+        let user = doc.structs.get("User").unwrap();
+        assert_eq!(user.fields.len(), 2);
+        assert_eq!(user.fields[0].name, "id");
+        assert_eq!(user.fields[1].name, "name");
     }
 
     #[test]

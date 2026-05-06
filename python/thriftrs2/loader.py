@@ -4,7 +4,14 @@ import re
 import threading
 from typing import Any, Optional
 
-from .thriftrs2 import ProtocolType, ThriftParser, ThriftClient, ThriftServer, TransportType
+from .thriftrs2 import (
+    AsyncThriftClient,
+    ProtocolType,
+    ThriftParser,
+    ThriftClient,
+    ThriftServer,
+    TransportType,
+)
 
 
 _INCLUDE_RE = re.compile(r'^\s*include\s+"([^"]+)"', re.MULTILINE)
@@ -188,6 +195,25 @@ def make_client(
     return client
 
 
+async def make_async_client(
+    service: ThriftService,
+    host: str,
+    port: int,
+    transport: TransportType = TransportType.Buffered,
+    protocol: ProtocolType = ProtocolType.Binary,
+) -> AsyncThriftClient:
+    """
+    Create a connected :class:`AsyncThriftClient`.
+
+    Async counterpart of :func:`make_client`. Returns a coroutine that resolves
+    to a client whose TCP connection has already been opened.
+    """
+    client = AsyncThriftClient(service.service_def, host, port, transport, protocol)
+    client.set_parser(service.parser)
+    await client.open()
+    return client
+
+
 class ThriftServerWrapper:
     def __init__(
         self,
@@ -196,9 +222,12 @@ class ThriftServerWrapper:
         transport: TransportType,
         workers: int = 1,
         protocol: ProtocolType = ProtocolType.Binary,
+        http_handler=None,
     ):
         server = self._server = ThriftServer(service.service_def, transport, workers, protocol)
         self._server.set_parser(service.parser)
+        if http_handler is not None:
+            server.register_http_handler(http_handler)
         if isinstance(handler, dict):
             for method_name, func in handler.items():
                 server.register_handler(method_name, func)
@@ -238,11 +267,12 @@ def make_server(
     *,
     workers: int = 1,
     protocol: ProtocolType = ProtocolType.Binary,
+    http_handler=None,
 ) -> ThriftServerWrapper:
     """
     Create a :class:`ThriftServer`, register *handler* methods, and start serving.
 
     Analogous to ``thriftpy2.rpc.make_server``.
     """
-    server = ThriftServerWrapper(service, handler, transport, workers, protocol)
+    server = ThriftServerWrapper(service, handler, transport, workers, protocol, http_handler)
     return server

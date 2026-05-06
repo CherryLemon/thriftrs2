@@ -12,9 +12,14 @@ use pyo3::types::PyDict;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -187,6 +192,16 @@ enum CallOutcome {
     Async(Py<PyAny>),
 }
 
+enum HttpCallbackOutcome {
+    Sync,
+    Async(Py<PyAny>),
+}
+
+#[cfg(unix)]
+type RawSocketHandle = RawFd;
+#[cfg(windows)]
+type RawSocketHandle = RawSocket;
+
 struct HandlerCtx<'a> {
     struct_map: &'a Arc<HashMap<String, ThriftStruct>>,
     handlers: &'a HashMap<String, RegisteredHandler>,
@@ -251,6 +266,7 @@ fn invoke_python_handler(
 pub struct ThriftServer {
     service: PyThriftService,
     handlers: HashMap<String, RegisteredHandler>,
+    http_handler: Option<RegisteredHandler>,
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
     protocol: ProtocolType,
@@ -274,6 +290,7 @@ impl ThriftServer {
         Self {
             service,
             handlers: HashMap::new(),
+            http_handler: None,
             struct_map: Arc::new(HashMap::new()),
             transport,
             protocol,
@@ -337,6 +354,22 @@ impl ThriftServer {
         Ok(())
     }
 
+    pub fn register_http_handler(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<()> {
+        let is_async = py
+            .import("inspect")?
+            .call_method1("iscoroutinefunction", (handler.bind(py),))?
+            .extract()?;
+        self.http_handler = Some(RegisteredHandler {
+            callable: handler,
+            is_async,
+        });
+        Ok(())
+    }
+
+    pub fn clear_http_handler(&mut self) {
+        self.http_handler = None;
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -356,6 +389,10 @@ impl ThriftServer {
                 .map(|(k, v)| (k.clone(), v.clone_ref(py)))
                 .collect(),
         );
+        let http_handler = self
+            .http_handler
+            .as_ref()
+            .map(|handler| Arc::new(handler.clone_ref(py)));
         let struct_map = Arc::clone(&self.struct_map);
         let transport = self.transport;
         let protocol = self.protocol;
@@ -384,6 +421,7 @@ impl ThriftServer {
                 addr,
                 service,
                 handlers,
+                http_handler,
                 struct_map,
                 transport,
                 protocol,
@@ -434,6 +472,7 @@ struct AcceptCtx {
     addr: String,
     service: Arc<PyThriftService>,
     handlers: Arc<HashMap<String, RegisteredHandler>>,
+    http_handler: Option<Arc<RegisteredHandler>>,
     struct_map: Arc<HashMap<String, ThriftStruct>>,
     transport: TransportType,
     protocol: ProtocolType,
@@ -472,12 +511,21 @@ async fn accept_loop(ctx: AcceptCtx) {
 
                 let service = Arc::clone(&ctx.service);
                 let handlers = Arc::clone(&ctx.handlers);
+                let http_handler = ctx.http_handler.as_ref().map(Arc::clone);
                 let struct_map = Arc::clone(&ctx.struct_map);
 
                 tokio::spawn(async move {
-                    if let Err(e) =
+                    let result = async {
+                        if let Some(http_handler) = http_handler {
+                            if stream_starts_with_http_method(&stream).await? {
+                                return handle_http_connection(stream, http_handler).await;
+                            }
+                        }
                         handle_connection(stream, service, handlers, struct_map, ctx.transport, ctx.protocol).await
-                    {
+                    }
+                    .await;
+
+                    if let Err(e) = result {
                         use std::io::ErrorKind::*;
                         if e.kind() != UnexpectedEof
                             && e.kind() != ConnectionReset
@@ -496,6 +544,147 @@ async fn accept_loop(ctx: AcceptCtx) {
     // if the loop ever ends.)
     // Note: unreachable in the current design, but kept for completeness.
     ctx.running.store(false, Ordering::SeqCst);
+}
+
+const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"HEAD ",
+    b"DELETE ",
+    b"PATCH ",
+    b"OPTIONS ",
+    b"TRACE ",
+    b"CONNECT ",
+];
+
+async fn stream_starts_with_http_method(stream: &TcpStream) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8];
+    loop {
+        let n = stream.peek(&mut buf).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+
+        let prefix = &buf[..n];
+        if is_http_method_prefix(prefix) {
+            return Ok(true);
+        }
+        if n == buf.len() || !could_be_http_method_prefix(prefix) {
+            return Ok(false);
+        }
+
+        // A client can trickle bytes; avoid spinning while preserving the
+        // unread stream for the Thrift codec if the prefix later diverges.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+fn is_http_method_prefix(prefix: &[u8]) -> bool {
+    HTTP_METHOD_PREFIXES
+        .iter()
+        .any(|method| prefix.len() >= method.len() && prefix.starts_with(method))
+}
+
+fn could_be_http_method_prefix(prefix: &[u8]) -> bool {
+    HTTP_METHOD_PREFIXES
+        .iter()
+        .any(|method| method.starts_with(prefix))
+}
+
+async fn handle_http_connection(
+    stream: TcpStream,
+    handler: Arc<RegisteredHandler>,
+) -> std::io::Result<()> {
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(handler.is_async)?;
+    let raw_socket = into_raw_socket_handle(std_stream);
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| invoke_python_http_handler(py, &handler, raw_socket))
+            .map_err(|err| err.to_string())
+    })
+    .await
+    .unwrap_or_else(|err| Err(err.to_string()))
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+
+    match outcome {
+        HttpCallbackOutcome::Sync => Ok(()),
+        HttpCallbackOutcome::Async(coro) => {
+            let locals = current_worker_python_locals()
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            let py_future: Result<_, String> = Python::attach(|py| {
+                pyo3_async_runtimes::into_future_with_locals(&locals, coro.into_bound(py))
+                    .map_err(|err: PyErr| err.to_string())
+            });
+            let py_future =
+                py_future.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+            py_future
+                .await
+                .map(|_| ())
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
+        }
+    }
+}
+
+fn invoke_python_http_handler(
+    py: Python<'_>,
+    handler: &RegisteredHandler,
+    raw_socket: RawSocketHandle,
+) -> PyResult<HttpCallbackOutcome> {
+    let socket_obj = match python_socket_from_raw_socket(py, raw_socket) {
+        Ok(socket_obj) => socket_obj,
+        Err(err) => {
+            close_raw_socket(raw_socket);
+            return Err(err);
+        }
+    };
+
+    let result = handler.callable.call1(py, (socket_obj,))?;
+    if handler.is_async {
+        Ok(HttpCallbackOutcome::Async(result))
+    } else {
+        Ok(HttpCallbackOutcome::Sync)
+    }
+}
+
+#[cfg(unix)]
+fn into_raw_socket_handle(stream: std::net::TcpStream) -> RawSocketHandle {
+    stream.into_raw_fd()
+}
+
+#[cfg(windows)]
+fn into_raw_socket_handle(stream: std::net::TcpStream) -> RawSocketHandle {
+    stream.into_raw_socket()
+}
+
+fn python_socket_from_raw_socket(
+    py: Python<'_>,
+    raw_socket: RawSocketHandle,
+) -> PyResult<Py<PyAny>> {
+    let socket_mod = py.import("socket")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("fileno", raw_socket)?;
+    socket_mod
+        .getattr("socket")?
+        .call((), Some(&kwargs))
+        .map(|socket| socket.unbind())
+}
+
+#[cfg(unix)]
+fn close_raw_socket(raw_socket: RawSocketHandle) {
+    // SAFETY: this is only called if Python failed to take ownership of the fd.
+    unsafe {
+        drop(OwnedFd::from_raw_fd(raw_socket));
+    }
+}
+
+#[cfg(windows)]
+fn close_raw_socket(raw_socket: RawSocketHandle) {
+    // SAFETY: this is only called if Python failed to take ownership of the socket.
+    unsafe {
+        drop(OwnedSocket::from_raw_socket(raw_socket));
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
