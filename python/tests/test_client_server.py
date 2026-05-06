@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import socket
 
 import pytest
 
@@ -153,6 +154,41 @@ def test_rpc_oneway_method_returns_none(service_module, free_tcp_port):
     try:
         client = thriftrs2.make_client(service_module.UserService, "127.0.0.1", free_tcp_port)
         assert client.call("notify", message="sent") is None
+    finally:
+        if client is not None:
+            client.close()
+        server._server.stop()
+
+
+def test_rpc_server_routes_http_probe_to_callback(service_module, free_tcp_port):
+    request_lines = []
+
+    def http_handler(sock):
+        with sock:
+            request = sock.recv(1024)
+            request_lines.append(request.split(b"\r\n", 1)[0])
+            sock.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+
+    server = thriftrs2.make_server(
+        service_module.UserService,
+        RecordingHandler(service_module.User),
+        transport=thriftrs2.TransportType.Buffered,
+        protocol=thriftrs2.ProtocolType.Binary,
+        workers=2,
+        http_handler=http_handler,
+    )
+    server.serve_forever("127.0.0.1", free_tcp_port, blocking=False)
+    client = None
+    try:
+        with socket.create_connection(("127.0.0.1", free_tcp_port), timeout=2) as sock:
+            sock.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            response = sock.recv(1024)
+
+        assert response.startswith(b"HTTP/1.1 204")
+        assert request_lines == [b"GET /health HTTP/1.1"]
+
+        client = thriftrs2.make_client(service_module.UserService, "127.0.0.1", free_tcp_port)
+        assert client.call("get_user", user_id=5).id == 5
     finally:
         if client is not None:
             client.close()

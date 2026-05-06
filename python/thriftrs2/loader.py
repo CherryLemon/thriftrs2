@@ -4,7 +4,14 @@ import re
 import threading
 from typing import Any, Optional
 
-from .thriftrs2 import ProtocolType, ThriftParser, ThriftClient, ThriftServer, TransportType
+from .thriftrs2 import (
+    AsyncThriftClient,
+    ProtocolType,
+    ThriftParser,
+    ThriftClient,
+    ThriftServer,
+    TransportType,
+)
 
 
 _INCLUDE_RE = re.compile(r'^\s*include\s+"([^"]+)"', re.MULTILINE)
@@ -188,7 +195,28 @@ def make_client(
     return client
 
 
+async def make_async_client(
+    service: ThriftService,
+    host: str,
+    port: int,
+    transport: TransportType = TransportType.Buffered,
+    protocol: ProtocolType = ProtocolType.Binary,
+) -> AsyncThriftClient:
+    """
+    Create a connected :class:`AsyncThriftClient`.
+
+    Async counterpart of :func:`make_client`. Returns a coroutine that resolves
+    to a client whose TCP connection has already been opened.
+    """
+    client = AsyncThriftClient(service.service_def, host, port, transport, protocol)
+    client.set_parser(service.parser)
+    await client.open()
+    return client
+
+
 class ThriftServerWrapper:
+    """High-level Thrift RPC server (see :func:`make_server`)."""
+
     def __init__(
         self,
         service: ThriftService,
@@ -196,9 +224,12 @@ class ThriftServerWrapper:
         transport: TransportType,
         workers: int = 1,
         protocol: ProtocolType = ProtocolType.Binary,
+        http_handler=None,
     ):
         server = self._server = ThriftServer(service.service_def, transport, workers, protocol)
         self._server.set_parser(service.parser)
+        if http_handler is not None:
+            server.register_http_handler(http_handler)
         if isinstance(handler, dict):
             for method_name, func in handler.items():
                 server.register_handler(method_name, func)
@@ -238,11 +269,52 @@ def make_server(
     *,
     workers: int = 1,
     protocol: ProtocolType = ProtocolType.Binary,
+    http_handler=None,
 ) -> ThriftServerWrapper:
     """
     Create a :class:`ThriftServer`, register *handler* methods, and start serving.
 
     Analogous to ``thriftpy2.rpc.make_server``.
+
+    Parameters
+    ----------
+    http_handler : callable, optional
+        Optional **same-port HTTP shim**: the accept loop peeks the first bytes
+        of each TCP connection. If they look like an HTTP request line (e.g.
+        ``GET /health HTTP/1.1``), the **whole** socket is passed to this
+        callable as a connected :class:`socket.socket` and Rust stops treating
+        it as Thrift. Anything that does not look like HTTP still goes through
+        the normal Thrift codec unchanged.
+
+        **Typical scenarios** (why not a second listen port or a reverse
+        proxy alone):
+
+        - **Orchestrator / LB probes only speak HTTP.** Kubernetes
+          ``livenessProbe`` / ``readinessProbe`` and many cloud load balancers
+          expect an HTTP ``GET`` on a fixed target port. If your service
+          contract or manifest only exposes **one** port (or changing ports
+          needs a slow release), answering ``GET /health`` or ``GET /ready`` on
+          the **same** port as Thrift avoids a parallel listener and keeps
+          deploy YAML simple.
+        - **Prometheus scraping.** The pull model issues HTTP ``GET`` (often
+          ``GET /metrics`` with ``text/plain`` exposition). If scrape targets
+          must hit the same socket your Thrift clients use—single Service port,
+          firewall rules, or not wanting a sidecar-only metrics port—you can
+          serve that path in ``http_handler`` while RPC stays Thrift.
+        - **Ops and SRE tooling.** On-call often sanity-checks with ``curl`` or
+          browser/devtools; a tiny HTTP response on the Thrift port gives a
+          human-readable "process is up" without installing a Thrift client.
+        - **Security / compliance scanners** that only issue HTTP ``GET`` to
+          detect "something listening" can get a deliberate 200/404 instead of
+          binary garbage, while real RPC traffic remains Thrift.
+        - **Gradual migration or brownfield**: legacy monitors or partner
+          integrations may hard-code "ping this URL"; you keep Thrift for
+          application RPC and satisfy those checks on one address.
+
+        It is **not** a full HTTP server: you implement read/write (or wrap the
+        socket with an HTTP library) inside the callback. Handler may be sync or
+        ``async def``. One accepted connection runs the handler once; HTTP
+        keep-alive and request parsing depth are entirely up to you.
     """
-    server = ThriftServerWrapper(service, handler, transport, workers, protocol)
+    server = ThriftServerWrapper(service, handler, transport, workers, protocol, http_handler)
     return server

@@ -3,7 +3,7 @@ mod protocol;
 mod python;
 
 use pyo3::prelude::*;
-use python::client::{ThriftApplicationException, ThriftClient};
+use python::client::{AsyncThriftClient, ThriftApplicationException, ThriftClient};
 use python::parser::{BinaryProtocol, CompactProtocol, JSONProtocol, ProtocolType, ThriftParser};
 use python::server::ThriftServer;
 use python::types::{
@@ -26,6 +26,7 @@ fn thriftrs2(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<JSONProtocol>()?;
     m.add_class::<TransportType>()?;
     m.add_class::<ThriftClient>()?;
+    m.add_class::<AsyncThriftClient>()?;
     m.add_class::<ThriftApplicationException>()?;
     Ok(())
 }

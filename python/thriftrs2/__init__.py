@@ -14,9 +14,10 @@ from .thriftrs2 import (
     TransportType,
     ThriftStructInstance,
     ThriftClient,
+    AsyncThriftClient,
     ThriftApplicationException,
 )
-from .loader import load, make_client, make_server
+from .loader import load, make_client, make_async_client, make_server
 from .protocol import TBinaryProtocol, TCompactProtocol, TFramedTransport, TBufferedTransport, serialize, deserialize, loads, dumps
 
 try:
@@ -39,11 +40,13 @@ __all__ = [
     "TransportType",
     "ThriftStructInstance",
     "ThriftClient",
+    "AsyncThriftClient",
     "ThriftApplicationException",
     "TFramedTransport",
     "TBufferedTransport",
     "load",
     "make_client",
+    "make_async_client",
     "make_server",
     "deserialize",
     "serialize",

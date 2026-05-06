@@ -106,6 +106,20 @@ def test_field_name_can_start_with_optional_keyword_prefix():
     assert [field.name for field in struct_def.fields] == ["optional_note", "required_label"]
 
 
+def test_parse_struct_fields_with_comma_separators():
+    parser = thriftrs2.ThriftParser()
+    parser.parse(
+        """
+        struct Names {
+            1: required i32 id,
+            2: optional string name,
+        }
+        """
+    )
+    struct_def = parser.get_struct("Names")
+    assert [field.name for field in struct_def.fields] == ["id", "name"]
+
+
 def test_parse_default_value_without_exposing_it(all_types_module):
     child_fields = {field.name: field for field in all_types_module.Child.fields}
     assert child_fields["name"].name == "name"
