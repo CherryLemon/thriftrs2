@@ -17,7 +17,7 @@ jobs:
         with:
           components: clippy
       - name: Cache Cargo artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -41,7 +41,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Cache Cargo and maturin build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
